@@ -1,0 +1,9 @@
+Balter EVO 2 Door Station — Home Assistant integration
+Copyright (c) 2026 bananaseason
+Licensed under the MIT License (see LICENSE).
+
+Portions of this software (the Quvii/Qualvision cloud REST client, the
+application frame formats, AES framing and related constants) are adapted from
+balter-evo-ha by LucaHerrero (https://github.com/LucaHerrero/balter-evo-ha),
+which is also MIT licensed. The MIT permission notice above covers those
+portions as well.

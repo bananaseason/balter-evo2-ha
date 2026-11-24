@@ -15,8 +15,6 @@
   "loggers": [
     "balter_evo2"
   ],
-  "requirements": [
-    "cryptography>=42.0.0"
-  ],
+  "requirements": [],
   "version": "1.0.0"
 }
