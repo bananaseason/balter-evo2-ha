@@ -64,6 +64,7 @@ from .transport import (
     StationBusyError,
     StationSilentError,
     TcpStationTransport,
+    TcpTalkChannel,
     TransportError,
 )
 
@@ -73,10 +74,22 @@ __all__ = [
     "DOOR_WRONG_PIN",
     "StationManager",
     "DoorRejectedError",
+    "NotLiveError",
     "StationBusyError",
     "StationSilentError",
     "TransportError",
 ]
+
+# Why a live view or snapshot session brought no video (``last_stream_failure``).
+FAILURE_NO_CREDENTIALS = "no_credentials"  # the cloud gave no dynamic password
+FAILURE_UNREACHABLE = "unreachable"  # no TCP connection or no setup echo
+FAILURE_BUSY = "busy"  # the station took the login but sent no video
+FAILURE_NO_FFMPEG = "no_ffmpeg"  # the live transcoder could not be started
+
+
+class NotLiveError(TransportError):
+    """Talk-back needs a running live view, and there is none."""
+
 
 # How long the whole door-unlock session may take (handshake + readiness + ack).
 DOOR_SESSION_TIMEOUT = 20.0
@@ -250,13 +263,138 @@ class StationManager:
         # Session of a running live view per station: a door command is sent
         # over it instead of ending the view to open a session of its own.
         self._live: dict[str, TcpStationTransport] = {}
+        # The secrets that session logged in with: the talk-back channel logs in
+        # with the same pair, without a trip to the cloud.
+        self._live_creds: dict[str, Credentials] = {}
         self._last_handshake: dict[str, str] = {}
+        # Why the last session of a station brought no video (None = it did).
+        self._failure: dict[str, str | None] = {}
+        # Listeners of the station's own audio (the visitor's voice, G.711
+        # A-law) during a live view, per station. Called from the receive thread.
+        self._audio_listeners: dict[str, list[Callable[[bytes], None]]] = {}
+        self._audio_guard = threading.Lock()
+        # Talk-back channel per station; it lives only alongside a live view.
+        self._talk: dict[str, TcpTalkChannel] = {}
+        self._talk_guard = threading.Lock()
 
     # --- Diagnostics ---------------------------------------------------------
 
     def handshake_states(self) -> dict[str, str]:
         """Return the last handshake state seen per station (for diagnostics)."""
         return dict(self._last_handshake)
+
+    def last_stream_failure(self, duid: str) -> str | None:
+        """Return why the last session of ``duid`` brought no video, or ``None``.
+
+        One of :data:`FAILURE_BUSY`, :data:`FAILURE_UNREACHABLE`,
+        :data:`FAILURE_NO_CREDENTIALS` and :data:`FAILURE_NO_FFMPEG`.
+        """
+        return self._failure.get(duid)
+
+    # --- Station audio and talk-back -----------------------------------------
+
+    def add_audio_listener(
+        self, duid: str, listener: Callable[[bytes], None]
+    ) -> Callable[[], None]:
+        """Hand the station's audio of every live view of ``duid`` to ``listener``.
+
+        ``listener`` gets the G.711 A-law bytes (8 kHz mono) of each audio packet,
+        called from the transport's receive thread; nothing is kept while no
+        listener is registered. Returns the function that removes it.
+        """
+        with self._audio_guard:
+            self._audio_listeners.setdefault(duid, []).append(listener)
+
+        def remove() -> None:
+            with self._audio_guard:
+                listeners = self._audio_listeners.get(duid, [])
+                if listener in listeners:
+                    listeners.remove(listener)
+                if not listeners:
+                    self._audio_listeners.pop(duid, None)
+
+        return remove
+
+    def _emit_audio(self, duid: str, data: bytes) -> None:
+        with self._audio_guard:
+            listeners = tuple(self._audio_listeners.get(duid, ()))
+        for listener in listeners:
+            try:
+                listener(data)
+            except Exception:  # noqa: BLE001 -- a listener must not stop the view
+                _LOGGER.exception("Audio listener of %s raised", duid)
+
+    async def async_open_talk(
+        self, device: Device, creds: Credentials | None = None
+    ) -> TcpTalkChannel:
+        """Open (or return the open) talk-back channel of the running live view.
+
+        Without ``creds`` the channel logs in with the secrets of the live view's
+        session. Raises :class:`NotLiveError` when no live view of the station
+        runs, and :class:`TransportError` when the station does not take the
+        channel.
+        """
+        return await self._hass.async_add_executor_job(
+            functools.partial(self._open_talk_sync, device, creds)
+        )
+
+    async def async_close_talk(self, duid: str, channel: TcpTalkChannel) -> None:
+        """Close ``channel`` (the talk-back channel of ``duid``)."""
+        await self._hass.async_add_executor_job(
+            functools.partial(self._close_talk_sync, duid, channel)
+        )
+
+    def _open_talk_sync(
+        self, device: Device, creds: Credentials | None
+    ) -> TcpTalkChannel:
+        duid = device.duid
+        live = self._live.get(duid)
+        if creds is None:
+            creds = self._live_creds.get(duid)
+        if live is None or not live.is_alive or creds is None:
+            raise NotLiveError(f"No live view of {duid} is running")
+        with self._talk_guard:
+            channel = self._talk.get(duid)
+            if channel is not None and channel.is_alive:
+                return channel
+        host = self._resolve_host(device)
+        if not host:
+            raise TransportError(f"No LAN host known for {duid}")
+        channel = TcpTalkChannel(
+            host,
+            STATION_PORT,
+            duid,
+            creds.dynamic_password,
+            creds.data_encode_key,
+            self._client_id,
+            self._oem,
+        )
+        channel.open(LOGIN_TIMEOUT)
+        old: TcpTalkChannel | None = None
+        with self._talk_guard:
+            # The live view may have ended while the channel was opened; it must
+            # not outlive the view (the view's end closes what is registered).
+            if self._live.get(duid) is not live or not live.is_alive:
+                stale = True
+            else:
+                stale = False
+                old = self._talk.get(duid)
+                self._talk[duid] = channel
+        if stale:
+            channel.close()
+            raise NotLiveError(f"The live view of {duid} ended")
+        if old is not None and old is not channel:
+            old.close()
+        return channel
+
+    def _close_talk_sync(self, duid: str, channel: TcpTalkChannel | None) -> None:
+        with self._talk_guard:
+            current = self._talk.get(duid)
+            if channel is None or current is channel:
+                self._talk.pop(duid, None)
+                channel = current if channel is None else channel
+        if channel is not None:
+            channel.close()
 
     # --- Public async API ----------------------------------------------------
 
@@ -391,6 +529,11 @@ class StationManager:
         _LOGGER.debug("Keeping the session with %s warm for %.0fs", duid, idle)
 
     def _release_all_sync(self) -> None:
+        with self._talk_guard:
+            talk = list(self._talk.values())
+            self._talk.clear()
+        for channel in talk:
+            channel.close()
         with self._warm_guard:
             warm = list(self._warm.values())
             self._warm.clear()
@@ -494,6 +637,7 @@ class StationManager:
         video (the station was reconnected to too soon, or somebody else is
         watching) is closed and tried once more after the minimum gap.
         """
+        self._failure[device.duid] = None
         transport = slot.transport
         if transport is not None:
             if transport.is_alive and transport.media_started.is_set():
@@ -510,6 +654,7 @@ class StationManager:
             _LOGGER.error(
                 "No dynamic_password for %s -- not opening a session", device.duid
             )
+            self._failure[device.duid] = FAILURE_NO_CREDENTIALS
             return None
 
         for attempt in (1, 2):
@@ -524,10 +669,17 @@ class StationManager:
                     return transport
             self._record_handshake(transport)
             reached = transport.logged_in.is_set()
+            silent = not connected or transport.station_silent
             slot.drop_transport()
             if not reached:
-                # Unreachable or refused: a second attempt would not differ.
+                # Unreachable or refused: a second attempt would not differ. A
+                # station that echoed the setup but never took the LOGIN is
+                # still holding another session.
+                self._failure[device.duid] = (
+                    FAILURE_UNREACHABLE if silent else FAILURE_BUSY
+                )
                 return None
+            self._failure[device.duid] = FAILURE_BUSY
             self._mark_session_end(device.duid)
             if should_stop is not None and should_stop():
                 return None
@@ -678,7 +830,9 @@ class StationManager:
             def _on_packet(packet: MediaPacket) -> None:
                 if packet.is_video:
                     arrivals.add(packet.timestamp)
-                packets_q.put(packet)
+                    packets_q.put(packet)
+                elif packet.kind == protocol.MEDIA_AUDIO:
+                    self._emit_audio(device.duid, packet.data)
 
             transport = self._video_session(
                 slot, device, creds, _on_packet, should_stop
@@ -691,11 +845,23 @@ class StationManager:
                 return 0
             ffmpeg = _start_mjpeg_transcoder()
             if ffmpeg is None:
+                self._failure[device.duid] = FAILURE_NO_FFMPEG
                 self._release_or_hand_over(slot, transport, "live stream")
                 return 0
 
             stop = threading.Event()
             frames_out = [0]
+
+            def _first_picture(h264: bytes) -> None:
+                # The transcoder shows its first picture only after about
+                # 32 kB of input (1.5-2 s at night); a still of the first
+                # keyframe is ready in ~0.1 s, so the view starts with that.
+                jpeg = media.h264_to_jpeg(h264)
+                if jpeg and frames_out[0] == 0 and not stop.is_set():
+                    frames_out[0] += 1
+                    with contextlib.suppress(Exception):
+                        on_jpeg(jpeg)
+
             workers = [
                 threading.Thread(
                     target=_jpeg_reader,
@@ -705,13 +871,14 @@ class StationManager:
                 ),
                 threading.Thread(
                     target=_video_pump,
-                    args=(ffmpeg, stop, packets_q),
+                    args=(ffmpeg, stop, packets_q, _first_picture),
                     name=f"balter_evo2-video-{device.duid}",
                     daemon=True,
                 ),
             ]
             deadline = time.monotonic() + (duration or STREAM_DURATION)
             self._live[device.duid] = transport
+            self._live_creds[device.duid] = creds
             try:
                 for worker in workers:
                     worker.start()
@@ -731,6 +898,9 @@ class StationManager:
                 # Wait for a door command that is in flight on this session.
                 with self._live_lock(device.duid):
                     self._live.pop(device.duid, None)
+                    self._live_creds.pop(device.duid, None)
+                # The talk-back channel lives only alongside the live view.
+                self._close_talk_sync(device.duid, None)
                 stop.set()
                 try:
                     self._release_or_hand_over(slot, transport, "live stream")
@@ -1052,11 +1222,14 @@ def _video_pump(
     ffmpeg: subprocess.Popen[bytes],
     stop: threading.Event,
     packets_q: queue.Queue[MediaPacket],
+    on_first_keyframe: Callable[[bytes], None] | None = None,
 ) -> None:
     """Feed the arriving video packets to ffmpeg, starting at a keyframe.
 
     Audio packets are skipped and everything before the first keyframe is
-    dropped: a decoder cannot start on a delta frame.
+    dropped: a decoder cannot start on a delta frame. The first keyframe is
+    also handed to ``on_first_keyframe`` (in a thread of its own) so the view
+    can show a picture before the transcoder has warmed up.
     """
     if ffmpeg.stdin is None:
         return
@@ -1072,6 +1245,13 @@ def _video_pump(
             if not packet.is_keyframe:
                 continue
             started = True
+            if on_first_keyframe is not None:
+                threading.Thread(
+                    target=on_first_keyframe,
+                    args=(packet.data,),
+                    name="balter_evo2-first-picture",
+                    daemon=True,
+                ).start()
         try:
             _write_all(ffmpeg.stdin, packet.data)
         except (BrokenPipeError, OSError, ValueError):

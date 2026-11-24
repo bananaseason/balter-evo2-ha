@@ -155,9 +155,9 @@ blocky, slow picture that an unpinned parser shows.
 ## The audio channel and talk-back
 
 Seen in a capture of the phone app (there over its UDP transport, where both channels
-share one connection; the frames are the same). **Not implemented by this integration.**
-
-The audio channel is a second channel opened with the setup body `a9 … [9] = 02`:
+share one connection) and confirmed on TCP: while a video session runs, a **second TCP
+connection** to port 34567 opened with the setup body `a9 … [9] = 02` becomes the audio
+channel. The call card of this integration uses exactly these frames.
 
 | Step | Direction | Frame |
 | --- | --- | --- |
@@ -185,8 +185,8 @@ video channel, not on the audio channel.
 - Whether a higher-resolution stream can be requested. The station sends 768×432
   unasked; no command that selects another stream has been identified.
 - The meaning of the two-byte answers to the setup frames (`00 05`, `01 01`).
-- Whether the audio channel and talk-back work on a second TCP connection the way they do
-  on the app's UDP transport.
+- Whether the station needs keepalives on the audio channel (the integration sends one
+  every 10 s while muted, like on the video connection).
 - The second byte of the open-door answer.
 - How a doorbell press is signalled locally, if it is at all: the station reports rings
   through the vendor cloud as push notifications.

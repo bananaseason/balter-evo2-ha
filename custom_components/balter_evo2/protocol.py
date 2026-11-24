@@ -68,9 +68,39 @@ FTYPE_LOGIN = 0x01
 FTYPE_CLOSE = 0x07
 FTYPE_MEDIA = 0xA0
 FTYPE_CONTROL = 0xFE
+# Audio channel (a second connection opened with ``build_a9_body(1)``).
+FTYPE_AUDIO_LOGIN = 0x0B  # LOGIN of the audio channel and its answer
+FTYPE_AUDIO_FORMAT = 0x0C  # audio format (sample rate in head bytes 15..16)
+FTYPE_TALK = 0x0D  # talk state: msg13 0 = talking, 1 = not talking
+FTYPE_TALK_AUDIO = 0xA2  # microphone audio, laid out like a media frame
 KNOWN_FTYPES = frozenset(
-    {FTYPE_KEEPALIVE, FTYPE_LOGIN, FTYPE_CLOSE, FTYPE_MEDIA, FTYPE_CONTROL}
+    {
+        FTYPE_KEEPALIVE,
+        FTYPE_LOGIN,
+        FTYPE_CLOSE,
+        FTYPE_MEDIA,
+        FTYPE_CONTROL,
+        FTYPE_AUDIO_LOGIN,
+        FTYPE_AUDIO_FORMAT,
+        FTYPE_TALK,
+        FTYPE_TALK_AUDIO,
+    }
 )
+# Frame types whose head carries a u32 content length (payload partly plaintext).
+LONG_FTYPES = frozenset({FTYPE_MEDIA, FTYPE_TALK_AUDIO})
+
+# Talk state values (``msg13`` of a ``FTYPE_TALK`` frame).
+TALK_ON = 0
+TALK_OFF = 1
+
+# Talk-back audio: G.711 A-law, 8 kHz mono, 320 bytes = 40 ms per frame.
+TALK_SAMPLE_RATE = 8000
+TALK_FRAME_BYTES = 320
+TALK_FRAME_SECONDS = 0.04
+# Content length of an "empty" audio-channel frame (no payload at all).
+EMPTY_CONTENT_LEN = 0xFFFF
+# Prefix of a talk frame's payload, followed by the data length (u16 LE).
+_TALK_PREFIX = b"\x00\x00\x01\xf0\x0e\x02"
 
 # Head field offsets (decrypted head).
 _HEAD_ENC_LEN = 9  # u16 LE: number of AES-encrypted bytes after the head
@@ -176,6 +206,83 @@ def build_a9_body(ch_idx: int) -> bytes:
     return bytes(body)
 
 
+def empty_frame(
+    ftype: int,
+    ts: int,
+    msg13: int,
+    key: bytes = FALLBACK_KEY,
+    b15: int = 0,
+    b16: int = 0,
+) -> bytes:
+    """Build an "empty" audio-channel frame (types ``0x0C`` / ``0x0D``).
+
+    A 32-byte head with ``encrypted_len = 32`` and ``content_len = 0xFFFF``,
+    followed by the SHA-256 of the plaintext head; both encrypted separately.
+    Verified live on a Balter EVO 2 (2026-11-24, ``reference/tools/talk_spike.py``).
+    """
+    head = bytearray(HEAD_LEN)
+    head[0] = ftype
+    struct.pack_into("<I", head, 1, ts)
+    struct.pack_into("<H", head, _HEAD_ENC_LEN, 32)
+    struct.pack_into("<H", head, _HEAD_CONTENT_LEN, EMPTY_CONTENT_LEN)
+    head[_HEAD_MSG13] = msg13
+    head[15] = b15
+    head[16] = b16
+    return cbc_encrypt(bytes(head), key) + cbc_encrypt(
+        hashlib.sha256(bytes(head)).digest(), key
+    )
+
+
+def audio_login_frame(
+    ts: int,
+    dynpw: str,
+    client_id: str,
+    oem: str = DEFAULT_OEM,
+    key: bytes = FALLBACK_KEY,
+) -> bytes:
+    """Build the LOGIN of the audio channel: type ``0x0B``, msg13 and byte 14 ``0xFF``.
+
+    It carries the same payload as the video LOGIN.
+    """
+    return ctrl_frame(
+        FTYPE_AUDIO_LOGIN,
+        ts,
+        build_login_payload(dynpw, client_id, oem),
+        key,
+        msg13=0xFF,
+        b14=0xFF,
+    )
+
+
+def audio_format_frame(ts: int, key: bytes = FALLBACK_KEY) -> bytes:
+    """Build the audio-format frame: type ``0x0C``, msg13 1, 8000 Hz in bytes 15..16."""
+    rate = struct.pack("<H", TALK_SAMPLE_RATE)
+    return empty_frame(FTYPE_AUDIO_FORMAT, ts, 1, key, b15=rate[0], b16=rate[1])
+
+
+def talk_state_frame(ts: int, talking: bool, key: bytes = FALLBACK_KEY) -> bytes:
+    """Build the talk-state frame: type ``0x0D``, msg13 0 = talking, 1 = not."""
+    return empty_frame(FTYPE_TALK, ts, TALK_ON if talking else TALK_OFF, key)
+
+
+def talk_frame(ts: int, alaw: bytes, key: bytes = FALLBACK_KEY) -> bytes:
+    """Build one talk-back audio frame (type ``0xA2``).
+
+    Laid out like a media frame: a head with ``encrypted_len = 32`` and a u32
+    content length, then the payload ``00 00 01 f0 0e 02 <len u16 LE> <A-law>``
+    whose first 32 bytes are encrypted and the rest is plaintext.
+    """
+    payload = _TALK_PREFIX + struct.pack("<H", len(alaw)) + bytes(alaw)
+    if len(payload) < 32:
+        raise ValueError(f"talk audio too short: {len(alaw)} bytes")
+    head = bytearray(HEAD_LEN)
+    head[0] = FTYPE_TALK_AUDIO
+    struct.pack_into("<I", head, 1, ts)
+    struct.pack_into("<H", head, _HEAD_ENC_LEN, 32)
+    struct.pack_into("<I", head, _HEAD_CONTENT_LEN, len(payload))
+    return cbc_encrypt(bytes(head), key) + cbc_encrypt(payload[:32], key) + payload[32:]
+
+
 def build_login_payload(dynpw: str, client_id: str, oem: str = DEFAULT_OEM) -> bytes:
     """Build the payload of the LOGIN (ftype 0x01) frame.
 
@@ -230,10 +337,10 @@ class FrameHead:
         """Return how many bytes follow the head on the wire.
 
         A control frame is fully encrypted (payload + SHA-256 trailer, padded).
-        A media frame carries ``content_len`` bytes, only the first
-        ``encrypted_len`` of them encrypted.
+        A media (or talk audio) frame carries ``content_len`` bytes, only the
+        first ``encrypted_len`` of them encrypted.
         """
-        return self.content_len if self.is_media else self.encrypted_len
+        return self.content_len if self.ftype in LONG_FTYPES else self.encrypted_len
 
 
 def parse_head(head: bytes) -> FrameHead | None:
@@ -255,7 +362,7 @@ def parse_head(head: bytes) -> FrameHead | None:
     encrypted_len = struct.unpack_from("<H", head, _HEAD_ENC_LEN)[0]
     if encrypted_len % 16:
         return None
-    if ftype == FTYPE_MEDIA:
+    if ftype in LONG_FTYPES:
         content_len = struct.unpack_from("<I", head, _HEAD_CONTENT_LEN)[0]
         if not (
             MEDIA_PACKET_HEAD_LEN <= content_len <= MAX_MEDIA_PAYLOAD
@@ -267,6 +374,39 @@ def parse_head(head: bytes) -> FrameHead | None:
         return None
     content_len = struct.unpack_from("<H", head, _HEAD_CONTENT_LEN)[0]
     return FrameHead(ftype, encrypted_len, content_len, head[_HEAD_MSG13])
+
+
+@dataclass(frozen=True, slots=True)
+class AudioChannelHead:
+    """The decoded head of one frame on the audio channel."""
+
+    ftype: int
+    msg13: int
+    content_len: int  # u16 (u32 for a talk audio frame)
+    body_len: int  # bytes that follow the head on the wire
+
+
+def parse_audio_channel_head(head: bytes) -> AudioChannelHead | None:
+    """Decode a decrypted head read on the audio channel.
+
+    The station's answers there (``0x0B``, ``0x0C``, ``0x0D``) carry flag bytes
+    whose meaning is not known, so only the lengths are checked -- the way the
+    verified probe (``reference/tools/talk_spike.py``) walks the stream. TCP
+    keeps the stream aligned; ``None`` means the head is not usable at all.
+    """
+    if len(head) < HEAD_LEN:
+        return None
+    ftype = head[0]
+    encrypted_len = struct.unpack_from("<H", head, _HEAD_ENC_LEN)[0]
+    if encrypted_len % 16:
+        return None
+    if ftype in LONG_FTYPES:
+        content_len = struct.unpack_from("<I", head, _HEAD_CONTENT_LEN)[0]
+        if not encrypted_len <= content_len <= MAX_MEDIA_PAYLOAD:
+            return None
+        return AudioChannelHead(ftype, 0, content_len, content_len)
+    content_len = struct.unpack_from("<H", head, _HEAD_CONTENT_LEN)[0]
+    return AudioChannelHead(ftype, head[_HEAD_MSG13], content_len, encrypted_len)
 
 
 def control_payload(head: FrameHead, body: bytes) -> bytes:

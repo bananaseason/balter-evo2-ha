@@ -3,6 +3,8 @@
 Home Assistant integration for door stations built on the Qualvision / Quvii platform
 (Balter EVO, Homaxi and other OEM brands).
 
+- Call card: a tap on the still opens a door-phone call — live picture, two-way audio, open
+  the door while you talk, hang up; a ring can open it as an incoming call
 - Camera: a stored still image plus an on-demand live view (768x432, ~18 fps) over a direct
   local TCP connection; the live view always ends by itself
 - Lock: door opener as a momentary lock entity

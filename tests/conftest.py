@@ -22,6 +22,7 @@ Provides:
 from __future__ import annotations
 
 import json
+import os
 import socket
 import struct
 import sys
@@ -58,6 +59,25 @@ TEST_CLIENT_ID = "0123456789abcdef"
 TEST_DUID = "testduid0001"
 TEST_OEM = "G0028G0126"
 TEST_PIN_SHA256 = "ab" * 32
+
+
+# --- Home Assistant -------------------------------------------------------------
+
+
+def bypass_frontend(hass: object) -> object:
+    """Count the ``frontend`` dependency as set up, without the frontend package.
+
+    The integration depends on ``frontend`` (it loads the call card on every
+    page), whose setup needs the ``hass_frontend`` package -- not installed for
+    the tests. What the integration uses of it is the extra-module list, which
+    is provided here; returns it so a test can look at the registered URLs.
+    """
+    from homeassistant.components.frontend import DATA_EXTRA_MODULE_URL, UrlManager
+
+    hass.config.components.add("frontend")  # type: ignore[attr-defined]
+    return hass.data.setdefault(  # type: ignore[attr-defined]
+        DATA_EXTRA_MODULE_URL, UrlManager(lambda *_: None, [])
+    )
 
 
 # --- vectors ---------------------------------------------------------------------
@@ -286,9 +306,100 @@ def make_h264_pframe(seed: int = 0) -> bytes:
     )
 
 
-def make_audio_chunk(seed: int = 0) -> bytes:
-    """A synthetic 160-byte G.711 chunk."""
-    return bytes((seed + i) % 256 for i in range(160))
+def make_audio_chunk(seed: int = 0, length: int = 160) -> bytes:
+    """A synthetic G.711 chunk (160 bytes unless told otherwise)."""
+    return bytes((seed + i) % 256 for i in range(length))
+
+
+def station_empty_frame(key: bytes, ftype: int, msg13: int, content_len: int) -> bytes:
+    """An answer of the station on the audio channel: a head and its SHA-256."""
+    import hashlib
+
+    from custom_components.balter_evo2.protocol import cbc_encrypt
+
+    head = build_head(ftype, 32, content_len, msg13=msg13, media=False)
+    return cbc_encrypt(bytes(head), key) + cbc_encrypt(
+        hashlib.sha256(bytes(head)).digest(), key
+    )
+
+
+def parse_audio_channel_frame(
+    buf: bytes, key: bytes
+) -> tuple[int, int, int, bytes, int] | None:
+    """Parse one client frame of the audio channel at the start of ``buf``.
+
+    Returns ``(ftype, msg13, content_len, payload, total_len)`` or None if
+    incomplete. ``payload`` is the decrypted control payload, or for a talk
+    frame (``0xA2``) the whole payload (first 32 bytes decrypted).
+    """
+    from custom_components.balter_evo2.protocol import cbc_decrypt
+
+    if len(buf) < 32:
+        return None
+    head = cbc_decrypt(buf[:32], key)
+    ftype = head[0]
+    enc_len = struct.unpack_from("<H", head, 9)[0]
+    if ftype == 0xA2:
+        clen = struct.unpack_from("<I", head, 11)[0]
+        total = 32 + clen
+        if len(buf) < total:
+            return None
+        payload = cbc_decrypt(buf[32 : 32 + enc_len], key) + buf[32 + enc_len : total]
+        return ftype, 0, clen, payload, total
+    total = 32 + enc_len
+    if len(buf) < total:
+        return None
+    clen = struct.unpack_from("<H", head, 11)[0]
+    body = cbc_decrypt(buf[32:total], key)
+    payload = b"" if clen == 0xFFFF else body[:clen]
+    return ftype, head[13], clen, payload, total
+
+
+def audio_frame_counter(head: bytes, key: bytes) -> int:
+    """Return the frame counter (head bytes 1..4) of an audio-channel frame."""
+    from custom_components.balter_evo2.protocol import cbc_decrypt
+
+    return struct.unpack_from("<I", cbc_decrypt(head[:32], key), 1)[0]
+
+
+# --- fake ffmpeg ---------------------------------------------------------------------
+
+LIVE_JPEG = b"\xff\xd8live\xff\xd9"
+
+
+class FakeFFmpeg:
+    """Stand-in for the ffmpeg transcoder: one JPEG out per chunk written in."""
+
+    def __init__(self) -> None:
+        read_fd, self._write_fd = os.pipe()
+        self.stdout = os.fdopen(read_fd, "rb", buffering=0)
+        self.stdin = self  # the pump writes to ``stdin.write`` / ``flush`` / ``close``
+        self.written = bytearray()
+        self.killed = False
+        self._lock = threading.Lock()
+
+    def write(self, data: bytes) -> int:
+        with self._lock:
+            self.written += data
+            if self._write_fd is not None:
+                os.write(self._write_fd, LIVE_JPEG)
+        return len(data)
+
+    def flush(self) -> None:
+        return None
+
+    def close(self) -> None:
+        with self._lock:
+            if self._write_fd is not None:
+                os.close(self._write_fd)
+                self._write_fd = None
+
+    def kill(self) -> None:
+        self.killed = True
+        self.close()
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
 
 
 # --- fake station -------------------------------------------------------------------
@@ -309,6 +420,14 @@ class FakeStation:
     Per-connection numbering is 1-based. ``no_video_connections=N`` makes the
     first N connections log in and become ready but never send video (the station
     that was reconnected to too soon).
+
+    Video connections are served one at a time, like the real station's single
+    session. A connection whose a9 body has byte 9 = 2 is the **audio channel**
+    and is served alongside: the station answers its LOGIN ``0x0B``, the format
+    ``0x0C`` and every talk state ``0x0D`` (``content_len`` 0 = talking, 1 =
+    not) with an empty frame of the same type, and records every frame (see
+    :attr:`audio_frames`, :meth:`talk_audio`). ``audio_accept=False`` leaves the
+    LOGIN unanswered, ``talk_answer=False`` the talk states.
     """
 
     def __init__(
@@ -332,6 +451,9 @@ class FakeStation:
         keepalive_every: float | None = None,
         heartbeat_every: float | None = None,
         chunk: int | None = None,
+        audio_chunk_len: int = 160,
+        audio_accept: bool = True,
+        talk_answer: bool = True,
     ) -> None:
         self.key = key
         self.echo = echo if echo is not None else load_fixture("a9_echo.bin")
@@ -354,6 +476,9 @@ class FakeStation:
         self.keepalive_every = keepalive_every
         self.heartbeat_every = heartbeat_every
         self.chunk = chunk
+        self.audio_chunk_len = audio_chunk_len
+        self.audio_accept = audio_accept
+        self.talk_answer = talk_answer
         self.a9_body: bytes | None = None
         self.frames: list[tuple[int, int, bytes, bytes]] = []  # ftype,msg13,payload,raw
         self.raw_stream = bytearray()
@@ -361,7 +486,17 @@ class FakeStation:
         self.connect_times: list[float] = []
         self.disconnect_times: list[float] = []
         self.sent_video: list[bytes] = []  # data of every video packet sent
+        self.sent_audio: list[bytes] = []  # data of every 0xE3 packet sent
+        # Audio channel: (ftype, msg13, content_len, payload, monotonic time).
+        self.audio_frames: list[tuple[int, int, int, bytes, float]] = []
+        # The frame counter of each of them, in arrival order.
+        self.audio_counters: list[int] = []
+        self.audio_connections = 0
+        self.audio_disconnect_times: list[float] = []
+        self._audio_conns: list[socket.socket] = []
         self._lock = threading.Lock()
+        self._video_slot = threading.Lock()
+        self._workers: list[threading.Thread] = []
         self._stop = threading.Event()
         self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -376,9 +511,11 @@ class FakeStation:
 
     # -- lifecycle
     def close(self) -> None:
-        """Stop the server and join its thread."""
+        """Stop the server and join its threads."""
         self._stop.set()
         self._thread.join(timeout=3)
+        for worker in list(self._workers):
+            worker.join(timeout=3)
         self._srv.close()
 
     def __enter__(self) -> FakeStation:
@@ -392,6 +529,36 @@ class FakeStation:
         """Return the client control frames received so far (optionally by type)."""
         with self._lock:
             return [f for f in self.frames if ftype is None or f[0] == ftype]
+
+    def audio_received(
+        self, ftype: int | None = None
+    ) -> list[tuple[int, int, int, bytes, float]]:
+        """Return the frames received on audio channels (optionally by type)."""
+        with self._lock:
+            return [f for f in self.audio_frames if ftype is None or f[0] == ftype]
+
+    def talk_audio(self) -> list[bytes]:
+        """Return the A-law data of every talk frame (``0xA2``) received."""
+        out = []
+        for _, _, _, payload, _ in self.audio_received(0xA2):
+            assert payload[:6] == b"\x00\x00\x01\xf0\x0e\x02", payload[:8].hex()
+            length = struct.unpack_from("<H", payload, 6)[0]
+            out.append(payload[8 : 8 + length])
+        return out
+
+    def talk_states(self) -> list[int]:
+        """Return the msg13 of every talk state (``0x0D``): 0 = talking, 1 = not."""
+        return [f[1] for f in self.audio_received(0x0D)]
+
+    def drop_audio_channels(self) -> None:
+        """Close every open audio channel from the station's side."""
+        with self._lock:
+            conns = list(self._audio_conns)
+        for conn in conns:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     def opens(self) -> list[tuple[int, int, bytes, bytes]]:
         """Return the OPENDOOR frames (``0xFE msg13=4``) received so far."""
@@ -414,15 +581,77 @@ class FakeStation:
             except (TimeoutError, OSError):
                 continue
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            worker = threading.Thread(
+                target=self._serve_conn, args=(conn,), daemon=True, name="fake-conn"
+            )
+            self._workers.append(worker)
+            worker.start()
+
+    def _serve_conn(self, conn: socket.socket) -> None:
+        """Serve one connection: the audio channel alongside, video one at a time."""
+        conn.settimeout(0.02)
+        try:
+            body = self._recv_exact(conn, 32)
+        except OSError:
+            body = None
+        if body is not None and len(body) == 32 and body[9] == 0x02:
+            try:
+                self._handle_audio(conn, body)
+            except OSError:
+                pass
+            finally:
+                with self._lock:
+                    if conn in self._audio_conns:
+                        self._audio_conns.remove(conn)
+                conn.close()
+                self.audio_disconnect_times.append(time.monotonic())
+            return
+        with self._video_slot:
             self.connections += 1
             self.connect_times.append(time.monotonic())
             try:
-                self._handle(conn, self.connections)
+                self._handle(conn, self.connections, body)
             except OSError:
                 pass
             finally:
                 conn.close()
                 self.disconnect_times.append(time.monotonic())
+
+    def _handle_audio(self, conn: socket.socket, body: bytes) -> None:
+        """Play the station side of the audio channel."""
+        self.audio_connections += 1
+        with self._lock:
+            self._audio_conns.append(conn)
+        self._send(conn, self.echo)
+        buf = bytearray()
+        while not self._stop.is_set():
+            try:
+                chunk = conn.recv(65536)
+            except TimeoutError:
+                continue
+            if not chunk:
+                return
+            buf += chunk
+            while True:
+                parsed = parse_audio_channel_frame(bytes(buf), self.key)
+                if parsed is None:
+                    break
+                ftype, msg13, clen, payload, total = parsed
+                counter = audio_frame_counter(bytes(buf[:32]), self.key)
+                del buf[:total]
+                with self._lock:
+                    self.audio_frames.append(
+                        (ftype, msg13, clen, payload, time.monotonic())
+                    )
+                    self.audio_counters.append(counter)
+                if ftype == 0x07:
+                    return
+                if ftype == 0x0B and self.audio_accept:
+                    self._send(conn, station_empty_frame(self.key, 0x0B, 0, 0xFFFF))
+                elif ftype == 0x0C:
+                    self._send(conn, station_empty_frame(self.key, 0x0C, 1, 0xFFFF))
+                elif ftype == 0x0D and self.talk_answer:
+                    self._send(conn, station_empty_frame(self.key, 0x0D, 0, msg13))
 
     def _recv_exact(self, conn: socket.socket, n: int) -> bytes | None:
         data = b""
@@ -452,17 +681,17 @@ class FakeStation:
             return [video_frame(key, data, keyframe=True)]
         data = make_h264_pframe(n)
         self.sent_video.append(data)
+        audio = make_audio_chunk(n, self.audio_chunk_len)
+        self.sent_audio.append(audio)
         out = [
-            audio_frame(key, make_audio_chunk(n), ts=n),
+            audio_frame(key, audio, ts=n),
             video_frame(key, data, keyframe=False, ts=n),
         ]
         if n % 10 == 0:
             out.append(heartbeat_frame(key))
         return out
 
-    def _handle(self, conn: socket.socket, index: int) -> None:
-        conn.settimeout(0.02)
-        body = self._recv_exact(conn, 32)
+    def _handle(self, conn: socket.socket, index: int, body: bytes | None) -> None:
         if body is None:
             return
         self.a9_body = body

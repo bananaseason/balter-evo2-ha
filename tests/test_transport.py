@@ -12,6 +12,7 @@ over a real socket (the fake station can dribble out one byte at a time).
 
 from __future__ import annotations
 
+import socket
 import time
 from collections.abc import Callable
 
@@ -842,3 +843,203 @@ def test_control_frame_parser_matches_fixture_helper() -> None:
     frame = protocol.ctrl_frame(0x0B, 0, b"abc", TEST_KEY, msg13=3)
     assert parse_ctrl_frame(frame + b"rest", TEST_KEY) == (0x0B, 3, b"abc", len(frame))
     assert parse_ctrl_frame(frame[:40], TEST_KEY) is None
+
+
+# --- talk-back channel ----------------------------------------------------------------
+
+
+def make_talk(port: int) -> tr.TcpTalkChannel:
+    return tr.TcpTalkChannel(
+        "127.0.0.1", port, TEST_DUID, TEST_DYNPW, TEST_KEY_STR, TEST_CLIENT_ID, TEST_OEM
+    )
+
+
+def test_talk_channel_handshake_follows_the_live_probe(
+    fake_station_factory: Callable[..., FakeStation],
+) -> None:
+    station = fake_station_factory()
+    talk = make_talk(station.port)
+    try:
+        talk.open(2.0)
+        assert talk.is_alive and not talk.talking
+        assert station.audio_connections == 1
+        assert station.connections == 0  # the video slot is not touched
+        frames = station.audio_received()
+        assert [(f[0], f[1]) for f in frames] == [(0x0B, 0xFF), (0x0C, 1), (0x0D, 1)]
+        assert frames[0][3] == protocol.build_login_payload(
+            TEST_DYNPW, TEST_CLIENT_ID, TEST_OEM
+        )
+        assert frames[1][2] == frames[2][2] == 0xFFFF  # empty frames
+        assert [a[0] for a in talk.answers()] == [0x0B, 0x0C, 0x0D]
+    finally:
+        talk.close()
+    assert station.wait_for(lambda: len(station.audio_disconnect_times) == 1)
+    assert station.audio_received()[-1][0] == 0x07  # goodbye
+
+
+def test_talk_audio_is_paced_at_40_ms_and_carries_the_data(
+    fake_station_factory: Callable[..., FakeStation],
+) -> None:
+    station = fake_station_factory()
+    talk = make_talk(station.port)
+    try:
+        talk.open(2.0)
+        assert talk.feed(b"\xd5" * 320) == 320  # not talking yet: dropped
+        assert talk.set_talking(True) is True
+        assert talk.talking and station.talk_states() == [1, 0]
+        chunks = [make_audio_chunk(i, 320) for i in range(6)]
+        talk.feed(b"".join(chunks[:3]))  # a burst ...
+        time.sleep(0.05)
+        talk.feed(chunks[3])
+        talk.feed(chunks[4] + chunks[5][:100])  # ... and a partial frame
+        assert station.wait_for(lambda: len(station.talk_audio()) == 5, 3)
+        time.sleep(0.15)
+        assert station.talk_audio() == chunks[:5]  # the partial frame waits
+        times = [f[4] for f in station.audio_received(0xA2)]
+        gaps = [b - a for a, b in zip(times, times[1:], strict=False)]
+        assert min(gaps) >= 0.03, gaps  # one frame per 40 ms, never a burst
+        talk.feed(chunks[5][100:])
+        assert station.wait_for(lambda: len(station.talk_audio()) == 6, 3)
+        assert station.talk_audio()[5] == chunks[5]
+
+        assert talk.set_talking(False) is True
+        assert station.talk_states() == [1, 0, 1]
+        talk.feed(b"\x55" * 640)
+        time.sleep(0.2)
+        assert len(station.talk_audio()) == 6  # nothing while not talking
+    finally:
+        talk.close()
+
+
+def test_a_muted_talk_channel_sends_keepalives_in_counter_order(
+    fake_station_factory: Callable[..., FakeStation],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Muted, nothing else leaves the channel: the keepalive keeps it from going
+    # silent for minutes, and stops while talk audio flows.
+    monkeypatch.setattr(tr, "KEEPALIVE_INTERVAL", 0.2)
+    station = fake_station_factory()
+    talk = make_talk(station.port)
+    try:
+        talk.open(2.0)
+        assert station.wait_for(lambda: len(station.audio_received(0x00)) >= 2, 3)
+        assert talk.is_alive
+        assert talk.set_talking(True)
+        keepalives = len(station.audio_received(0x00))
+        for i in range(12):  # ~0.5 s of audio, fed in real time
+            talk.feed(make_audio_chunk(i, 320))
+            time.sleep(0.04)
+        assert station.wait_for(lambda: len(station.talk_audio()) == 12, 3)
+        assert len(station.audio_received(0x00)) <= keepalives + 1
+    finally:
+        talk.close()
+    assert station.wait_for(lambda: len(station.audio_disconnect_times) == 1)
+    # Every frame carries the next counter value, in the order sent.
+    # (The format and the first talk state share one counter, as in the spike.)
+    counters = list(station.audio_counters)
+    assert counters[:3] == [1, 2, 2]
+    assert counters[2:] == list(range(2, len(counters)))
+
+
+def test_talk_buffer_is_capped_at_400_ms_dropping_the_oldest(
+    fake_station_factory: Callable[..., FakeStation],
+) -> None:
+    station = fake_station_factory()
+    talk = make_talk(station.port)
+    try:
+        talk.open(2.0)
+        assert talk.set_talking(True)
+        chunks = [make_audio_chunk(i, 320) for i in range(20)]
+        with talk._audio_cv:  # one burst of 800 ms, before the sender wakes up
+            talk._pending += b"".join(chunks[:10])
+        dropped = talk.feed(b"".join(chunks[10:]))
+        assert dropped == 10 * 320 and talk.bytes_dropped == 10 * 320
+        assert station.wait_for(lambda: len(station.talk_audio()) == 10, 3)
+        time.sleep(0.15)
+        assert station.talk_audio() == chunks[10:]  # the newest 400 ms
+    finally:
+        talk.close()
+
+
+def test_closing_while_talking_stops_talking_first(
+    fake_station_factory: Callable[..., FakeStation],
+) -> None:
+    station = fake_station_factory()
+    talk = make_talk(station.port)
+    talk.open(2.0)
+    assert talk.set_talking(True)
+    talk.close()
+    assert station.wait_for(lambda: len(station.audio_disconnect_times) == 1)
+    assert [f[0] for f in station.audio_received()][-2:] == [0x0D, 0x07]
+    assert station.talk_states()[-1] == 1
+    assert not talk.is_alive and not talk.talking
+    talk.close()  # idempotent
+
+
+def test_an_unanswered_audio_login_fails_and_closes(
+    fake_station_factory: Callable[..., FakeStation],
+) -> None:
+    station = fake_station_factory(audio_accept=False)
+    talk = make_talk(station.port)
+    started = time.monotonic()
+    with pytest.raises(TransportError, match="audio LOGIN"):
+        talk.open(0.5)
+    assert time.monotonic() - started < 2
+    assert not talk.is_alive
+    assert station.wait_for(lambda: len(station.audio_disconnect_times) == 1)
+
+
+def test_an_unanswered_talk_start_keeps_the_microphone_off(
+    fake_station_factory: Callable[..., FakeStation],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tr, "TALK_ANSWER_TIMEOUT", 0.3)
+    station = fake_station_factory(talk_answer=False)
+    talk = make_talk(station.port)
+    try:
+        # The handshake needs the 0x0D answer too.
+        with pytest.raises(TransportError, match="audio format"):
+            talk.open(0.5)
+    finally:
+        talk.close()
+    station.talk_answer = True
+    talk = make_talk(station.port)
+    try:
+        talk.open(2.0)
+        station.talk_answer = False
+        assert talk.set_talking(True) is False
+        assert not talk.talking
+        talk.feed(b"\xd5" * 640)
+        time.sleep(0.15)
+        assert station.talk_audio() == []
+    finally:
+        talk.close()
+
+
+def test_a_dropped_talk_channel_is_reported(
+    fake_station_factory: Callable[..., FakeStation],
+) -> None:
+    station = fake_station_factory()
+    talk = make_talk(station.port)
+    closed: list[bool] = []
+    talk.set_close_callback(lambda: closed.append(True))
+    try:
+        talk.open(2.0)
+        assert talk.set_talking(True)
+        station.drop_audio_channels()
+        assert station.wait_for(lambda: closed == [True], 3)
+        assert not talk.is_alive and not talk.talking
+        assert talk.set_talking(True) is False
+    finally:
+        talk.close()
+    assert closed == [True]  # once, and not again for our own close
+
+
+def test_an_unreachable_station_is_silent_for_the_talk_channel() -> None:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    talk = make_talk(port)
+    with pytest.raises(StationSilentError):
+        talk.open(0.5)
+    assert not talk.is_alive

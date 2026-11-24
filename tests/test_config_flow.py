@@ -21,6 +21,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from conftest import bypass_frontend
 from homeassistant import config_entries
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.core import HomeAssistant
@@ -78,8 +79,9 @@ def lan_down() -> Iterator[MagicMock]:
 
 
 @pytest.fixture(autouse=True)
-def no_setup() -> Iterator[None]:
+def no_setup(hass: HomeAssistant) -> Iterator[None]:
     """Creating an entry must not set up the real integration (sockets, ffmpeg)."""
+    bypass_frontend(hass)
     with patch("custom_components.balter_evo2.async_setup_entry", return_value=True):
         yield
 

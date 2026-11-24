@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.2.0 (2026-11-24)
+
+### Added
+
+- **Call card** (`custom:balter-evo2-call-card`): a door-phone call on the dashboard. A tap on
+  the still opens a full-screen call with the live picture, the visitor's voice, your
+  microphone (talk / mute), **Open door** while you talk and hang up. A ring (any helper that
+  turns on) shows an incoming call with Answer and Decline. The card is served and loaded by
+  the integration; there is no resource to add. See the README.
+- **Two-way audio.** The station's audio, which arrived with the video and was thrown away,
+  now reaches the call; the microphone goes to the station over a second connection (the
+  audio channel of the phone app, see docs/PROTOCOL.md).
+- WebSocket commands `balter_evo2/call/start`, `heartbeat`, `talk`, `audio`, `extend` and
+  `end` (the card's interface).
+
+### Fixed
+
+- **The station stayed held after the viewer left the phone app.** The Home Assistant phone
+  app keeps reading a camera feed after its dialog closed or the app went to the background,
+  so a live view opened from the camera dialog ran its full 90 seconds. A call of the call
+  card is held by the card's heartbeat instead of the video connection: it ends about a second
+  after hang-up and within about three seconds of the app going to the background (measured
+  on the real station: picture after 0.5 s, station free 1.3 s after hang-up, 4 s after the
+  heartbeat stopped).
+- A live view showed its first picture only after one and a half to three seconds: the video
+  decoder waits for about 32 kB of input. The first keyframe is now shown at once, about half
+  a second after the connection is made.
+
+### Upgrading
+
+Update and **restart** Home Assistant (the card and the new commands are registered at
+start). Replace the camera's `picture-entity` cards with the call card; for the microphone,
+open Home Assistant over https.
+
 ## 1.1.3 (2026-11-24)
 
 ### Fixed

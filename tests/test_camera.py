@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import voluptuous as vol
+from conftest import bypass_frontend
 from homeassistant.components.camera import DATA_COMPONENT
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
@@ -36,10 +37,10 @@ from custom_components.balter_evo2.const import (
     CONF_STREAM_DURATION,
     DEFAULT_SNAPSHOT_TTL,
     DOMAIN,
+    LIVE_VIEW_HARD_CAP,
     SERVICE_REFRESH_SNAPSHOT,
     SERVICE_START_LIVE_VIEW,
     SERVICE_STOP_LIVE_VIEW,
-    STREAM_DURATION_MAX,
 )
 from custom_components.balter_evo2.station import DoorRejectedError
 
@@ -132,6 +133,14 @@ class FakeManager:
     async def async_release_all(self) -> None:
         self.released_all += 1
 
+    def last_stream_failure(self, duid: str) -> str | None:
+        return None
+
+    def add_audio_listener(
+        self, duid: str, listener: Callable[[bytes], None]
+    ) -> Callable[[], None]:
+        return lambda: None
+
 
 @pytest.fixture
 def storage(hass: HomeAssistant, tmp_path: Any) -> str:
@@ -196,6 +205,7 @@ def setup_camera(
         # The manifest depends on the ffmpeg component, whose setup probes the
         # binary; ffmpeg is not needed (nor wanted) here.
         hass.config.components.add("ffmpeg")
+        bypass_frontend(hass)
         ok = await hass.config_entries.async_setup(entry.entry_id)
         assert ok is expect_ok
         await hass.async_block_till_done()
@@ -478,7 +488,7 @@ async def test_start_live_view_streams_then_returns_to_idle_and_keeps_the_last_f
     assert state_of(hass) == "streaming"
     assert await until(lambda: manager.stream_calls != [])
     # the manager only gets the hard cap; the real length is the should_stop callback
-    assert manager.stream_calls == [STREAM_DURATION_MAX]
+    assert manager.stream_calls == [LIVE_VIEW_HARD_CAP]
     # while it runs, the newest live frame is the image, not the stored still
     assert await until(lambda: cam._live_jpeg == jpeg(3))
     assert await cam.async_camera_image() == jpeg(3)
@@ -493,7 +503,7 @@ async def test_start_live_view_streams_then_returns_to_idle_and_keeps_the_last_f
     assert read_still(storage) == jpeg(3)
     assert hass.states.get(ENTITY_ID).attributes["still_taken"] is not None
     assert manager.snapshot_calls == 0
-    assert manager.stream_calls == [STREAM_DURATION_MAX]
+    assert manager.stream_calls == [LIVE_VIEW_HARD_CAP]
 
 
 async def test_the_view_length_is_enforced_through_should_stop(
@@ -506,7 +516,7 @@ async def test_the_view_length_is_enforced_through_should_stop(
     assert state_of(hass) == "streaming"
     assert await until(lambda: state_of(hass) == "idle")
     assert 0.35 <= time.monotonic() - started < 3
-    assert manager.stream_calls == [STREAM_DURATION_MAX]
+    assert manager.stream_calls == [LIVE_VIEW_HARD_CAP]
     assert manager.last_should_stop() is True
     assert manager.stopped_by_caller == 1
 

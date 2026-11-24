@@ -15,7 +15,6 @@ transcoder are replaced by recording fakes.
 from __future__ import annotations
 
 import asyncio
-import os
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -23,9 +22,11 @@ from typing import Any
 
 import pytest
 from conftest import (
+    LIVE_JPEG,
     TEST_DUID,
     TEST_KEY,
     TEST_PIN_SHA256,
+    FakeFFmpeg,
     FakeStation,
     audio_frame,
     make_audio_chunk,
@@ -54,7 +55,6 @@ GAP = 0.3
 MEDIA_START = 0.4
 FAKE_JPEG = b"\xff\xd8fake-jpeg\xff\xd9"
 FAKE_MP4 = b"fake-mp4"
-LIVE_JPEG = b"\xff\xd8live\xff\xd9"
 
 
 class Recorder:
@@ -65,41 +65,7 @@ class Recorder:
         self.mp4_inputs: list[tuple[bytes, float]] = []
         self.ports: dict[str, int] = {}
         self.transports: list[Any] = []
-
-
-class FakeFFmpeg:
-    """Stand-in for the ffmpeg transcoder: one JPEG out per chunk written in."""
-
-    def __init__(self) -> None:
-        read_fd, self._write_fd = os.pipe()
-        self.stdout = os.fdopen(read_fd, "rb", buffering=0)
-        self.stdin = self  # the pump writes to ``stdin.write`` / ``flush`` / ``close``
-        self.written = bytearray()
-        self.killed = False
-        self._lock = threading.Lock()
-
-    def write(self, data: bytes) -> int:
-        with self._lock:
-            self.written += data
-            if self._write_fd is not None:
-                os.write(self._write_fd, LIVE_JPEG)
-        return len(data)
-
-    def flush(self) -> None:
-        return None
-
-    def close(self) -> None:
-        with self._lock:
-            if self._write_fd is not None:
-                os.close(self._write_fd)
-                self._write_fd = None
-
-    def kill(self) -> None:
-        self.killed = True
-        self.close()
-
-    def wait(self, timeout: float | None = None) -> int:
-        return 0
+        self.talks: list[Any] = []
 
 
 @pytest.fixture
@@ -113,6 +79,14 @@ def rec(monkeypatch: pytest.MonkeyPatch) -> Iterator[Recorder]:
         return t
 
     monkeypatch.setattr(station_mod, "TcpStationTransport", build)
+    real_talk = station_mod.TcpTalkChannel
+
+    def build_talk(host: str, port: int, duid: str, *args: Any, **kwargs: Any) -> Any:
+        t = real_talk(host, r.ports.get(duid, r.ports["*"]), duid, *args, **kwargs)
+        r.talks.append(t)
+        return t
+
+    monkeypatch.setattr(station_mod, "TcpTalkChannel", build_talk)
     monkeypatch.setattr(station_mod, "SESSION_MIN_GAP", GAP)
     monkeypatch.setattr(station_mod, "MEDIA_START_TIMEOUT", MEDIA_START)
     monkeypatch.setattr(station_mod, "LOGIN_TIMEOUT", 2.0)
@@ -462,7 +436,9 @@ async def test_stream_ends_at_its_duration_and_releases_the_station(
     jpegs: list[bytes] = []
     frames = await manager.async_stream(device, creds, 0.6, jpegs.append, lambda: False)
     assert frames == len(jpegs) > 0
-    assert set(jpegs) == {LIVE_JPEG}
+    # The first keyframe's still may come first, then only the transcoder's frames.
+    assert LIVE_JPEG in jpegs
+    assert set(jpegs[1:]) == {LIVE_JPEG}
     assert await until(lambda: len(station.disconnect_times) == 1)
     assert await until(lambda: not _workers_alive())
 
@@ -846,3 +822,238 @@ async def test_stop_set_before_the_first_frame_starts_no_ffmpeg(
     )
     assert started == []
     assert await until(lambda: len(station.disconnect_times) == 1)
+
+
+# --- station audio and talk-back --------------------------------------------------------------
+
+
+async def _start_stream(
+    manager: Any,
+    device: Device,
+    creds: Credentials,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[asyncio.Task, threading.Event, list[bytes]]:
+    monkeypatch.setattr(station_mod, "_start_mjpeg_transcoder", lambda: FakeFFmpeg())
+    stop = threading.Event()
+    jpegs: list[bytes] = []
+    task = asyncio.create_task(
+        manager.async_stream(device, creds, 30.0, jpegs.append, stop.is_set)
+    )
+    assert await until(lambda: len(jpegs) >= 2)
+    return task, stop, jpegs
+
+
+async def test_station_audio_reaches_listeners_only_while_registered(
+    manager: Any,
+    device: Device,
+    creds: Credentials,
+    make_station: Callable[..., FakeStation],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    station = make_station(stream=True, frame_interval=0.01, audio_chunk_len=320)
+    heard: list[bytes] = []
+    remove = manager.add_audio_listener(device.duid, heard.append)
+    other: list[bytes] = []
+    manager.add_audio_listener("another-station", other.append)
+    task, stop, _ = await _start_stream(manager, device, creds, monkeypatch)
+    assert await until(lambda: len(heard) >= 5)
+    # The visitor's voice arrives packet by packet, in order, unchanged.
+    assert heard == station.sent_audio[: len(heard)]
+    assert other == []
+    remove()
+    count = len(heard)
+    await asyncio.sleep(0.2)
+    assert len(heard) == count  # nothing after the listener left
+    assert device.duid not in manager._audio_listeners
+    stop.set()
+    await asyncio.wait_for(task, 10)
+
+
+async def test_talk_needs_a_live_view(
+    manager: Any,
+    device: Device,
+    creds: Credentials,
+    make_station: Callable[..., FakeStation],
+) -> None:
+    station = make_station(stream=True)
+    with pytest.raises(station_mod.NotLiveError):
+        await manager.async_open_talk(device, creds)
+    assert station.audio_connections == 0 and station.connections == 0
+
+
+async def test_talk_channel_rides_along_a_live_view_and_ends_with_it(
+    manager: Any,
+    device: Device,
+    creds: Credentials,
+    make_station: Callable[..., FakeStation],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    station = make_station(stream=True, frame_interval=0.01)
+    task, stop, jpegs = await _start_stream(manager, device, creds, monkeypatch)
+    # Without secrets of its own it logs in with those of the live view.
+    talk = await manager.async_open_talk(device)
+    assert talk.is_alive
+    assert station.audio_received()[0][3] == station_mod.protocol.build_login_payload(
+        creds.dynamic_password, manager._client_id, manager._oem
+    )
+    assert await manager.async_open_talk(device, creds) is talk  # one per station
+    assert station.audio_connections == 1 and station.connections == 1
+    assert await hass_job(talk.set_talking, True)
+    talk.feed(b"\xd5" * 640)
+    assert await until(lambda: len(station.talk_audio()) == 2)
+    # The picture keeps flowing and a door command still rides the live session.
+    seen = len(jpegs)
+    assert await manager.async_open_door(device, creds, 1, 2, TEST_PIN_SHA256)
+    assert await until(lambda: len(jpegs) > seen + 2)
+    assert station.connections == 1 and talk.talking
+
+    stop.set()
+    await asyncio.wait_for(task, 10)
+    # The audio channel is closed with (and before) the live view.
+    assert not talk.is_alive
+    assert await until(lambda: len(station.audio_disconnect_times) == 1)
+    assert await until(lambda: len(station.disconnect_times) == 1)
+    assert station.audio_disconnect_times[0] <= station.disconnect_times[0]
+    assert [f[0] for f in station.audio_received()][-2:] == [0x0D, 0x07]
+    assert manager._talk == {}
+    assert manager._live_creds == {}
+    with pytest.raises(station_mod.NotLiveError):
+        await manager.async_open_talk(device)
+
+
+async def test_closing_the_talk_channel_keeps_the_live_view(
+    manager: Any,
+    device: Device,
+    creds: Credentials,
+    make_station: Callable[..., FakeStation],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    station = make_station(stream=True, frame_interval=0.01)
+    task, stop, jpegs = await _start_stream(manager, device, creds, monkeypatch)
+    talk = await manager.async_open_talk(device, creds)
+    await manager.async_close_talk(device.duid, talk)
+    assert await until(lambda: len(station.audio_disconnect_times) == 1)
+    seen = len(jpegs)
+    assert await until(lambda: len(jpegs) > seen + 2)
+    assert not station.disconnect_times and manager._talk == {}
+    # A new one can be opened afterwards.
+    again = await manager.async_open_talk(device, creds)
+    assert again is not talk and again.is_alive
+    stop.set()
+    await asyncio.wait_for(task, 10)
+    assert not again.is_alive
+
+
+async def test_release_all_closes_the_talk_channel(
+    manager: Any,
+    device: Device,
+    creds: Credentials,
+    make_station: Callable[..., FakeStation],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    make_station(stream=True, frame_interval=0.01)
+    task, stop, _ = await _start_stream(manager, device, creds, monkeypatch)
+    talk = await manager.async_open_talk(device, creds)
+    await manager.async_release_all()
+    assert not talk.is_alive
+    stop.set()
+    await asyncio.wait_for(task, 10)
+
+
+async def test_last_stream_failure_tells_busy_from_unreachable(
+    manager: Any,
+    device: Device,
+    creds: Credentials,
+    rec: Recorder,
+    make_station: Callable[..., FakeStation],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(station_mod, "_start_mjpeg_transcoder", lambda: FakeFFmpeg())
+    # Logged in, but no video: somebody else holds the station.
+    make_station(stream=True, no_video_connections=5)
+    assert (
+        await manager.async_stream(device, creds, 5.0, lambda _: None, lambda: False)
+        == 0
+    )
+    assert manager.last_stream_failure(device.duid) == station_mod.FAILURE_BUSY
+
+    # Nobody listens at all.
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    rec.ports["*"] = s.getsockname()[1]
+    s.close()
+    assert (
+        await manager.async_stream(device, creds, 5.0, lambda _: None, lambda: False)
+        == 0
+    )
+    assert manager.last_stream_failure(device.duid) == station_mod.FAILURE_UNREACHABLE
+
+    # No ffmpeg.
+    make_station(stream=True)
+    monkeypatch.setattr(station_mod, "_start_mjpeg_transcoder", lambda: None)
+    assert (
+        await manager.async_stream(device, creds, 5.0, lambda _: None, lambda: False)
+        == 0
+    )
+    assert manager.last_stream_failure(device.duid) == station_mod.FAILURE_NO_FFMPEG
+
+    # Video: no failure.
+    monkeypatch.setattr(station_mod, "_start_mjpeg_transcoder", lambda: FakeFFmpeg())
+    assert (
+        await manager.async_stream(device, creds, 0.4, lambda _: None, lambda: False)
+        > 0
+    )
+    assert manager.last_stream_failure(device.duid) is None
+
+
+async def hass_job(func: Callable[..., Any], *args: Any) -> Any:
+    return await asyncio.get_running_loop().run_in_executor(None, func, *args)
+
+
+def test_video_pump_hands_the_first_keyframe_over_once() -> None:
+    """The first keyframe goes to the decoder and, once, to the quick picture."""
+    import io
+    import queue as queue_mod
+    import threading as threading_mod
+
+    from custom_components.balter_evo2 import station as station_mod
+    from custom_components.balter_evo2.protocol import (
+        MEDIA_AUDIO,
+        MEDIA_KEYFRAME,
+        MEDIA_VIDEO,
+        MediaPacket,
+    )
+
+    class FakeFfmpeg:
+        stdin = io.BytesIO()
+
+    got: list[bytes] = []
+    done = threading_mod.Event()
+
+    def on_first(data: bytes) -> None:
+        got.append(data)
+        done.set()
+
+    q: queue_mod.Queue[MediaPacket] = queue_mod.Queue()
+    for kind, data in (
+        (MEDIA_VIDEO, b"delta-before"),
+        (MEDIA_AUDIO, b"audio"),
+        (MEDIA_KEYFRAME, b"key-1"),
+        (MEDIA_VIDEO, b"delta"),
+        (MEDIA_KEYFRAME, b"key-2"),
+    ):
+        q.put(MediaPacket(kind, 0.0, 768, 432, data))
+    stop = threading_mod.Event()
+    pump = threading_mod.Thread(
+        target=station_mod._video_pump, args=(FakeFfmpeg(), stop, q, on_first)
+    )
+    pump.start()
+    assert done.wait(2)
+    while not q.empty():
+        threading_mod.Event().wait(0.01)
+    stop.set()
+    pump.join(2)
+    assert got == [b"key-1"]
+    assert FakeFfmpeg.stdin.getvalue() == b"key-1deltakey-2"
