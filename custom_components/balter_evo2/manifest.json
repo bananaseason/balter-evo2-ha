@@ -1,0 +1,22 @@
+{
+  "domain": "balter_evo2",
+  "name": "Balter EVO 2 Door Station",
+  "codeowners": [
+    "@bananaseason"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "ffmpeg"
+  ],
+  "documentation": "https://github.com/bananaseason/balter-evo2-ha",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/bananaseason/balter-evo2-ha/issues",
+  "loggers": [
+    "balter_evo2"
+  ],
+  "requirements": [
+    "cryptography>=42.0.0"
+  ],
+  "version": "1.0.0"
+}

@@ -1,0 +1,94 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Qualvision-/Quvii-Cloud-Konto",
+        "description": "Melde dich mit E-Mail und Passwort der Handy-App deiner Türstation an (Balter EVO, Quvii, Homaxi, ...), nicht mit dem lokalen Geräte-Passwort. Das Konto dient nur dazu, die Zugangsgeheimnisse der Station zu holen; Video und Türsteuerung laufen lokal.",
+        "data": {
+          "email": "E-Mail",
+          "password": "Passwort"
+        }
+      },
+      "device": {
+        "title": "Türstation",
+        "description": "Wähle die Türstation und gib ihre Adresse im lokalen Netzwerk ein. Die Station muss von Home Assistant über TCP-Port 34567 erreichbar sein. Richte im Router eine DHCP-Reservierung ein, damit sich die Adresse nicht ändert.",
+        "data": {
+          "device": "Türstation",
+          "host": "Host (IP-Adresse)"
+        },
+        "data_description": {
+          "device": "In deinem Cloud-Konto gefundene Türstationen.",
+          "host": "Lokale IP-Adresse oder Hostname der Türstation."
+        }
+      },
+      "reconfigure": {
+        "title": "Adresse der Türstation ändern",
+        "description": "Gib die neue lokale Adresse der Türstation ein.",
+        "data": {
+          "host": "Host (IP-Adresse)"
+        },
+        "data_description": {
+          "host": "Lokale IP-Adresse oder Hostname der Türstation."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Erneut anmelden",
+        "description": "Die Quvii-Cloud hat die gespeicherten Zugangsdaten für {email} abgelehnt. Bitte das Passwort erneut eingeben.",
+        "data": {
+          "password": "Passwort"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "E-Mail oder Passwort falsch",
+      "cannot_connect": "Verbindung zum Quvii-Cloud-Server fehlgeschlagen",
+      "cannot_connect_lan": "Die Türstation ist im lokalen Netzwerk nicht erreichbar (TCP-Port 34567)"
+    },
+    "abort": {
+      "already_configured": "Dieser Account ist bereits eingerichtet",
+      "no_devices": "In diesem Konto wurden keine Türstationen gefunden",
+      "reauth_successful": "Die Anmeldedaten wurden aktualisiert",
+      "reconfigure_successful": "Die Adresse der Türstation wurde aktualisiert",
+      "unique_id_mismatch": "Die Anmeldung gehört zu einem anderen Konto als dem eingerichteten"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Einstellungen der Türstation",
+        "data": {
+          "door_pin": "Tür-PIN (optional)",
+          "warm_idle": "Sitzung offen halten (Sekunden)",
+          "stream_duration": "Maximale Livestream-Dauer (Sekunden)",
+          "snapshot_ttl": "Snapshot-Cachezeit (Sekunden)",
+          "host": "Host (IP-Adresse)",
+          "enable_audio": "Audioverbindung öffnen"
+        },
+        "data_description": {
+          "door_pin": "Leer lassen, damit der in der Cloud hinterlegte Öffnungscode der Türstation verwendet wird. Nur eintragen, wenn du bewusst eine abweichende PIN senden willst. Eine falsche PIN lehnt die Station stillschweigend ab.",
+          "warm_idle": "Wie lange die Verbindung zur Türstation nach einem Befehl offen bleibt. In dieser Zeit öffnet ein weiterer Druck sofort, statt den kompletten Verbindungsaufbau zu bezahlen. Solange die Verbindung offen ist, ist die Station für Klingel und Handy-App belegt, darum nicht höher setzen als nötig. 0 schaltet das Offenhalten ab.",
+          "stream_duration": "Jeder Livestream wird nach dieser Zeit beendet, damit der einzelne Slot der Station für Klingel und andere Bewohner frei wird.",
+          "snapshot_ttl": "Wie lange ein Standbild wiederverwendet wird, bevor die Station erneut kontaktiert wird.",
+          "host": "Lokale IP-Adresse oder Hostname der Türstation.",
+          "enable_audio": "Öffnet die zweite (Audio-)Verbindung. Für Kamera und Schloss nicht nötig; ausgeschaltet lassen, außer du brauchst sie."
+        }
+      }
+    }
+  },
+  "services": {
+    "record_clip": {
+      "name": "Videoclip aufnehmen",
+      "description": "Nimmt einen kurzen Clip der Türstation auf und speichert ihn als MP4.",
+      "fields": {
+        "filename": {
+          "name": "Dateiname",
+          "description": "Zielpfad für das MP4, z. B. /media/tuerstation.mp4."
+        },
+        "seconds": {
+          "name": "Länge",
+          "description": "Cliplänge in Sekunden."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,94 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Qualvision / Quvii cloud account",
+        "description": "Sign in with the e-mail and password of your door station's phone app (Balter EVO, Quvii, Homaxi, ...), not the local device password. The account is only used to fetch the station's access secrets; video and door control run locally.",
+        "data": {
+          "email": "E-mail",
+          "password": "Password"
+        }
+      },
+      "device": {
+        "title": "Door station",
+        "description": "Choose the door station and enter its address on your local network. The station must be reachable from Home Assistant on TCP port 34567. Give it a DHCP reservation in your router so the address does not change.",
+        "data": {
+          "device": "Door station",
+          "host": "Host (IP address)"
+        },
+        "data_description": {
+          "device": "Door stations found in your cloud account.",
+          "host": "Local IP address or host name of the door station."
+        }
+      },
+      "reconfigure": {
+        "title": "Change door station address",
+        "description": "Enter the new local address of the door station.",
+        "data": {
+          "host": "Host (IP address)"
+        },
+        "data_description": {
+          "host": "Local IP address or host name of the door station."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Sign in again",
+        "description": "The Quvii cloud rejected the stored credentials for {email}. Please enter the password again.",
+        "data": {
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Wrong e-mail or password",
+      "cannot_connect": "Could not reach the Quvii cloud server",
+      "cannot_connect_lan": "Could not reach the door station on your local network (TCP port 34567)"
+    },
+    "abort": {
+      "already_configured": "This account is already configured",
+      "no_devices": "No door stations were found in this account",
+      "reauth_successful": "The credentials were updated",
+      "reconfigure_successful": "The door station address was updated",
+      "unique_id_mismatch": "Those credentials belong to a different account than the configured one"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Door station settings",
+        "data": {
+          "door_pin": "Door PIN (optional)",
+          "warm_idle": "Keep session open (seconds)",
+          "stream_duration": "Maximum live stream length (seconds)",
+          "snapshot_ttl": "Snapshot cache time (seconds)",
+          "host": "Host (IP address)",
+          "enable_audio": "Open the audio connection"
+        },
+        "data_description": {
+          "door_pin": "Leave empty to use the unlock code the door station has registered in the cloud. Only set this if you deliberately want to send a different PIN. A wrong PIN is rejected silently by the station.",
+          "warm_idle": "How long the connection to the door station stays open after a command. Within that window another press unlocks instantly instead of paying for the full handshake. While the connection is open the station is busy for the doorbell and the phone app, so do not set this higher than needed. 0 disables keeping it open.",
+          "stream_duration": "Every live stream is stopped after this time so the station's single slot is released for the doorbell and other residents.",
+          "snapshot_ttl": "How long a still image is reused before the station is contacted again.",
+          "host": "Local IP address or host name of the door station.",
+          "enable_audio": "Opens the second (audio) connection. Not needed for camera and lock; leave off unless you know you need it."
+        }
+      }
+    }
+  },
+  "services": {
+    "record_clip": {
+      "name": "Record clip",
+      "description": "Records a short clip from the door station and saves it as MP4.",
+      "fields": {
+        "filename": {
+          "name": "File name",
+          "description": "Target path for the MP4, for example /media/door_station.mp4."
+        },
+        "seconds": {
+          "name": "Length",
+          "description": "Clip length in seconds."
+        }
+      }
+    }
+  }
+}

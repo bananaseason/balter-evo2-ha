@@ -1,0 +1,19 @@
+*.pcap
+*.pcapng
+captures/
+# Private reverse-engineering notes, the owner's capture-derived data and a
+# verbatim upstream copy -- never publish these (see reference/README if added).
+reference/
+secrets.yaml
+secrets.*
+*.secret
+.env
+credentials*.json
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.DS_Store

@@ -1,0 +1,7 @@
+{
+  "services": {
+    "record_clip": {
+      "service": "mdi:video-box"
+    }
+  }
+}

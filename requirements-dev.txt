@@ -1,0 +1,6 @@
+pytest-homeassistant-custom-component
+cryptography>=42.0.0
+# Pulled in so the config-flow tests can load the integration, which declares a
+# dependency on Home Assistant's ffmpeg component (import module: haffmpeg).
+ha-ffmpeg
+ruff
