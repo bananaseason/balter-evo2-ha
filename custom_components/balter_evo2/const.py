@@ -55,7 +55,12 @@ RELOCK_DELAY = 8
 
 # Lock created when the cloud reports no sub-devices for a station.
 # door=1 / lock=1 is the door opener of every EVO 2 station (verified live).
-DEFAULT_LOCK = {"code": "door1-lock1", "name": "Door opener", "door": 1, "locknumber": 1}
+DEFAULT_LOCK = {
+    "code": "door1-lock1",
+    "name": "Door opener",
+    "door": 1,
+    "locknumber": 1,
+}
 
 # --- Camera --------------------------------------------------------------------
 

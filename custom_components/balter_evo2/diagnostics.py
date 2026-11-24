@@ -48,9 +48,7 @@ def _lock_exposed_to_assist(hass: HomeAssistant, entry: BalterEvo2ConfigEntry) -
     registry = er.async_get(hass)
     lock_entities = [
         reg_entry.entity_id
-        for reg_entry in er.async_entries_for_config_entry(
-            registry, entry.entry_id
-        )
+        for reg_entry in er.async_entries_for_config_entry(registry, entry.entry_id)
         if reg_entry.domain == "lock"
     ]
     if not lock_entities:
@@ -66,9 +64,7 @@ def _lock_exposed_to_assist(hass: HomeAssistant, entry: BalterEvo2ConfigEntry) -
     exposed: dict[str, bool] = {}
     for entity_id in lock_entities:
         with contextlib.suppress(Exception):
-            exposed[entity_id] = async_should_expose(
-                hass, "conversation", entity_id
-            )
+            exposed[entity_id] = async_should_expose(hass, "conversation", entity_id)
     return exposed or "unknown"
 
 
@@ -127,9 +123,7 @@ async def async_get_device_diagnostics(
     hass: HomeAssistant, entry: BalterEvo2ConfigEntry, device: DeviceEntry
 ) -> dict[str, Any]:
     """Return redacted diagnostics for one station device."""
-    duid = next(
-        (ident[1] for ident in device.identifiers if ident[0] == DOMAIN), None
-    )
+    duid = next((ident[1] for ident in device.identifiers if ident[0] == DOMAIN), None)
     data = entry.runtime_data
     state = (data.coordinator.data or {}).get(duid) if duid else None
 

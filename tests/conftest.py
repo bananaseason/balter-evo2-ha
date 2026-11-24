@@ -92,8 +92,6 @@ def key() -> bytes:
     return TEST_KEY
 
 
-
-
 # --- frame helpers (station side) -------------------------------------------------
 
 MEDIA_VIDEO = 0xE0
@@ -249,7 +247,9 @@ def audio_frame(key: bytes, data: bytes, *, ts: int = 0) -> bytes:
     )
 
 
-def control_frame(key: bytes, msg13: int, payload: bytes = b"\x00", ftype: int = 0xFE) -> bytes:
+def control_frame(
+    key: bytes, msg13: int, payload: bytes = b"\x00", ftype: int = 0xFE
+) -> bytes:
     """One wire control frame."""
     from custom_components.balter_evo2.protocol import ctrl_frame
 
@@ -270,15 +270,20 @@ def make_h264_keyframe(seed: int = 0) -> bytes:
     """A synthetic Annex-B keyframe: SPS + PPS + IDR (> 400 bytes in total)."""
     filler = bytes((seed + i * 7) % 251 + 1 for i in range(400))
     return (
-        b"\x00\x00\x00\x01\x67" + bytes(range(1, 20))
-        + b"\x00\x00\x00\x01\x68" + b"\xce\x3c\x80"
-        + b"\x00\x00\x00\x01\x65" + filler
+        b"\x00\x00\x00\x01\x67"
+        + bytes(range(1, 20))
+        + b"\x00\x00\x00\x01\x68"
+        + b"\xce\x3c\x80"
+        + b"\x00\x00\x00\x01\x65"
+        + filler
     )
 
 
 def make_h264_pframe(seed: int = 0) -> bytes:
     """A synthetic Annex-B delta frame (a start code and a non-IDR slice)."""
-    return b"\x00\x00\x00\x01\x41" + bytes((seed * 3 + i * 5) % 251 + 1 for i in range(300))
+    return b"\x00\x00\x00\x01\x41" + bytes(
+        (seed * 3 + i * 5) % 251 + 1 for i in range(300)
+    )
 
 
 def make_audio_chunk(seed: int = 0) -> bytes:
@@ -442,7 +447,10 @@ class FakeStation:
             return [video_frame(key, data, keyframe=True)]
         data = make_h264_pframe(n)
         self.sent_video.append(data)
-        out = [audio_frame(key, make_audio_chunk(n), ts=n), video_frame(key, data, keyframe=False, ts=n)]
+        out = [
+            audio_frame(key, make_audio_chunk(n), ts=n),
+            video_frame(key, data, keyframe=False, ts=n),
+        ]
         if n % 10 == 0:
             out.append(heartbeat_frame(key))
         return out

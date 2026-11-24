@@ -97,9 +97,7 @@ def _host_resolver(entry: BalterEvo2ConfigEntry):
     return resolve
 
 
-async def async_setup_entry(
-    hass: HomeAssistant, entry: BalterEvo2ConfigEntry
-) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: BalterEvo2ConfigEntry) -> bool:
     """Set up Qualvision from a config entry."""
     client_id = _client_identity(hass, entry)
     client = BalterEvo2CloudClient(
@@ -149,9 +147,7 @@ async def async_setup_entry(
     return True
 
 
-async def async_unload_entry(
-    hass: HomeAssistant, entry: BalterEvo2ConfigEntry
-) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: BalterEvo2ConfigEntry) -> bool:
     """Unload a config entry, leaving nothing of ours running.
 
     A warm station session would keep occupying the station's single slot (also
@@ -166,25 +162,23 @@ async def async_unload_entry(
     return unloaded
 
 
-async def async_remove_entry(
-    hass: HomeAssistant, entry: BalterEvo2ConfigEntry
-) -> None:
+async def async_remove_entry(hass: HomeAssistant, entry: BalterEvo2ConfigEntry) -> None:
     """Delete the entry's stored stills when it is removed for good."""
     storage = hass.config.path(STORAGE_DIR)
 
     def _purge() -> None:
         with contextlib.suppress(OSError):
             for name in os.listdir(storage):
-                if name.startswith(f"{DOMAIN}.{entry.entry_id}.") and name.endswith(".jpg"):
+                if name.startswith(f"{DOMAIN}.{entry.entry_id}.") and name.endswith(
+                    ".jpg"
+                ):
                     with contextlib.suppress(OSError):
                         os.remove(os.path.join(storage, name))
 
     await hass.async_add_executor_job(_purge)
 
 
-async def async_reload_entry(
-    hass: HomeAssistant, entry: BalterEvo2ConfigEntry
-) -> None:
+async def async_reload_entry(hass: HomeAssistant, entry: BalterEvo2ConfigEntry) -> None:
     """Reload the entry when its options change (host, PIN, warm idle, ...)."""
     await hass.config_entries.async_reload(entry.entry_id)
 
@@ -210,7 +204,5 @@ async def async_migrate_entry(
             options.pop(CONF_SNAPSHOT_TTL)
         if options.get(CONF_WARM_IDLE) == 10:
             options.pop(CONF_WARM_IDLE)
-        hass.config_entries.async_update_entry(
-            entry, options=options, minor_version=2
-        )
+        hass.config_entries.async_update_entry(entry, options=options, minor_version=2)
     return True

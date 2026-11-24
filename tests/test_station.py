@@ -150,7 +150,9 @@ def device() -> Device:
 @pytest.fixture
 def creds() -> Credentials:
     return Credentials(
-        dynamic_password="p" * 96, data_encode_key="k" * 32, out_auth_code=TEST_PIN_SHA256
+        dynamic_password="p" * 96,
+        data_encode_key="k" * 32,
+        out_auth_code=TEST_PIN_SHA256,
     )
 
 
@@ -223,7 +225,10 @@ async def test_snapshot_without_keyframe_is_none(
 ) -> None:
     monkeypatch.setattr(station_mod, "SNAPSHOT_WINDOW", 0.5)
     station = make_station(
-        media=[video_frame(TEST_KEY, make_h264_pframe(i), keyframe=False, ts=i) for i in range(3)]
+        media=[
+            video_frame(TEST_KEY, make_h264_pframe(i), keyframe=False, ts=i)
+            for i in range(3)
+        ]
     )
     assert await manager.async_snapshot(device, creds) is None
     assert rec.jpeg_inputs == []
@@ -471,7 +476,10 @@ async def test_stream_without_ffmpeg_gives_up_and_releases_the_station(
 ) -> None:
     station = make_station(stream=True)
     monkeypatch.setattr(station_mod, "_start_mjpeg_transcoder", lambda: None)
-    assert await manager.async_stream(device, creds, 5.0, lambda jpg: None, lambda: False) == 0
+    assert (
+        await manager.async_stream(device, creds, 5.0, lambda jpg: None, lambda: False)
+        == 0
+    )
     assert await until(lambda: len(station.disconnect_times) == 1)
 
 
@@ -485,9 +493,7 @@ async def test_warm_session_is_reused_by_the_next_door_command_and_released(
     make_station: Callable[..., FakeStation],
 ) -> None:
     station = make_station()
-    manager = station_mod.StationManager(
-        hass, lambda d: "127.0.0.1", warm_idle=30.0
-    )
+    manager = station_mod.StationManager(hass, lambda d: "127.0.0.1", warm_idle=30.0)
     assert await manager.async_open_door(device, creds, 1, 1, TEST_PIN_SHA256) is True
     await asyncio.sleep(0.2)
     assert not station.disconnect_times  # kept warm for the next press
@@ -528,7 +534,7 @@ async def test_record_clip_returns_mp4_of_the_video_from_the_first_keyframe(
     monkeypatch.setattr(station_mod, "CLIP_LEAD_SECONDS", 0.0)
     station = make_station(stream=True, frame_interval=0.01)
     assert await manager.async_record_clip(device, creds, 0.5) == FAKE_MP4
-    (h264, seconds), = rec.mp4_inputs
+    ((h264, seconds),) = rec.mp4_inputs
     assert seconds == 0.5
     assert h264.startswith(make_h264_keyframe(0))
     assert len(h264) > len(make_h264_keyframe(0)) + 300  # deltas followed
@@ -560,7 +566,7 @@ async def test_open_door_true_only_on_ack(
 ) -> None:
     station = make_station()
     assert await manager.async_open_door(device, creds, 2, 3, TEST_PIN_SHA256) is True
-    (_f, msg13, payload, _raw), = station.opens()
+    ((_f, msg13, payload, _raw),) = station.opens()
     assert msg13 == 4
     assert payload[0] == 2 and payload[2] == 3
     assert payload[16:] == TEST_PIN_SHA256.encode()
@@ -763,7 +769,9 @@ async def test_stop_during_setup_prevents_the_retry_and_ffmpeg(
     station = make_station(stream=True, no_video_connections=99)
     started: list[int] = []
     monkeypatch.setattr(
-        station_mod, "_start_mjpeg_transcoder", lambda: started.append(1) or FakeFFmpeg()
+        station_mod,
+        "_start_mjpeg_transcoder",
+        lambda: started.append(1) or FakeFFmpeg(),
     )
     t0 = time.monotonic()
     frames = await manager.async_stream(
@@ -786,8 +794,13 @@ async def test_stop_set_before_the_first_frame_starts_no_ffmpeg(
     station = make_station(stream=True)
     started: list[int] = []
     monkeypatch.setattr(
-        station_mod, "_start_mjpeg_transcoder", lambda: started.append(1) or FakeFFmpeg()
+        station_mod,
+        "_start_mjpeg_transcoder",
+        lambda: started.append(1) or FakeFFmpeg(),
     )
-    assert await manager.async_stream(device, creds, 30.0, lambda j: None, lambda: True) == 0
+    assert (
+        await manager.async_stream(device, creds, 30.0, lambda j: None, lambda: True)
+        == 0
+    )
     assert started == []
     assert await until(lambda: len(station.disconnect_times) == 1)

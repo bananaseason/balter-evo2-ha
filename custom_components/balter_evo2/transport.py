@@ -551,9 +551,7 @@ class TcpStationTransport:
                 self._emit_media(payload)
             else:
                 del buf[:total]
-                self._emit_control(
-                    head.ftype, head.msg13, control_payload(head, plain)
-                )
+                self._emit_control(head.ftype, head.msg13, control_payload(head, plain))
 
     def _resync(self) -> bool:
         """Drop bytes until the buffer starts on a frame head again.
@@ -631,7 +629,9 @@ class TcpStationTransport:
             and not self.device_ready.is_set()
         ):
             self.device_ready.set()
-            _LOGGER.debug("Station %s signalled session ready (0xFE msg13=2)", self._duid)
+            _LOGGER.debug(
+                "Station %s signalled session ready (0xFE msg13=2)", self._duid
+            )
         if ftype == FTYPE_CONTROL and msg13 == MSG_OPENDOOR:
             self._door_answer = payload
             _LOGGER.debug(
@@ -735,9 +735,7 @@ class TcpStationTransport:
         """Send the 64-byte keepalive control frame every interval."""
         while not self._stop.wait(KEEPALIVE_INTERVAL):
             try:
-                self._raw_send(
-                    ctrl_frame(FTYPE_KEEPALIVE, self._ts, b"", self._key)
-                )
+                self._raw_send(ctrl_frame(FTYPE_KEEPALIVE, self._ts, b"", self._key))
             except (OSError, TransportError):
                 self._peer_closed = True
                 self._wake_waiters()

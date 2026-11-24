@@ -99,9 +99,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up the Qualvision camera entities."""
     data = entry.runtime_data
-    snapshot_ttl = float(
-        data.options.get(CONF_SNAPSHOT_TTL, DEFAULT_SNAPSHOT_TTL)
-    )
+    snapshot_ttl = float(data.options.get(CONF_SNAPSHOT_TTL, DEFAULT_SNAPSHOT_TTL))
     stream_duration = float(
         data.options.get(CONF_STREAM_DURATION, DEFAULT_STREAM_DURATION)
     )
@@ -124,9 +122,7 @@ async def async_setup_entry(
             vol.Required(ATTR_FILENAME): cv.string,
             vol.Optional(ATTR_SECONDS, default=5.0): vol.All(
                 vol.Coerce(float),
-                vol.Range(
-                    min=RECORD_CLIP_MIN_SECONDS, max=RECORD_CLIP_MAX_SECONDS
-                ),
+                vol.Range(min=RECORD_CLIP_MIN_SECONDS, max=RECORD_CLIP_MAX_SECONDS),
             ),
         },
         "async_record_clip",
@@ -333,7 +329,9 @@ class BalterEvo2Camera(CoordinatorEntity[BalterEvo2Coordinator], Camera):
         if self._is_stopping() and task is not None and not task.done():
             await asyncio.wait({task}, timeout=STREAM_STOP_TIMEOUT)
 
-    def _start_stream(self, duration: float | None = None, extend: bool = False) -> None:
+    def _start_stream(
+        self, duration: float | None = None, extend: bool = False
+    ) -> None:
         length = min(duration or self._stream_duration, STREAM_DURATION_MAX)
         if self._streaming:
             if extend:
@@ -433,7 +431,9 @@ class BalterEvo2Camera(CoordinatorEntity[BalterEvo2Coordinator], Camera):
     def _stop_if_unwatched(self) -> None:
         self._unwatched_handle = None
         if self._viewers <= 0 and self._streaming and self._viewer_owned:
-            _LOGGER.debug("Nobody watches %s any more -- ending the live view", self._duid)
+            _LOGGER.debug(
+                "Nobody watches %s any more -- ending the live view", self._duid
+            )
             self._request_stop()
 
     def _cancel_unwatched_stop(self) -> None:
@@ -465,7 +465,9 @@ class BalterEvo2Camera(CoordinatorEntity[BalterEvo2Coordinator], Camera):
             return False
         if self._last_image is None:
             return not self._first_still_tried or self._snapshot_ttl > 0
-        return self._snapshot_ttl > 0 and now - self._last_image_time > self._snapshot_ttl
+        return (
+            self._snapshot_ttl > 0 and now - self._last_image_time > self._snapshot_ttl
+        )
 
     async def async_refresh_snapshot(self) -> None:
         """Fetch a fresh still now (``refresh_snapshot`` service)."""
@@ -537,9 +539,7 @@ class BalterEvo2Camera(CoordinatorEntity[BalterEvo2Coordinator], Camera):
             )
             task.cancel()
 
-    async def async_record_clip(
-        self, seconds: float, filename: str
-    ) -> dict[str, Any]:
+    async def async_record_clip(self, seconds: float, filename: str) -> dict[str, Any]:
         """Record a short MP4 clip and write it to ``filename``.
 
         Backs the ``balter_evo2.record_clip`` entity service. The path must be in
@@ -552,9 +552,7 @@ class BalterEvo2Camera(CoordinatorEntity[BalterEvo2Coordinator], Camera):
 
         async with self._lock:
             creds = await self.coordinator.async_credentials(self._duid)
-            clip = await self._manager.async_record_clip(
-                self._device, creds, seconds
-            )
+            clip = await self._manager.async_record_clip(self._device, creds, seconds)
 
         if not clip:
             raise HomeAssistantError(
@@ -567,7 +565,5 @@ class BalterEvo2Camera(CoordinatorEntity[BalterEvo2Coordinator], Camera):
                 fh.write(clip)
 
         await self.hass.async_add_executor_job(_write)
-        _LOGGER.info(
-            "Wrote %.1fs clip (%d bytes) to %s", seconds, len(clip), filename
-        )
+        _LOGGER.info("Wrote %.1fs clip (%d bytes) to %s", seconds, len(clip), filename)
         return {"filename": filename, "size": len(clip), "seconds": seconds}

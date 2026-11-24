@@ -173,7 +173,9 @@ class _WarmSession:
             if self._done:
                 return
             self._done = True
-        _LOGGER.debug("Warm session with %s expired -- releasing the station", self.duid)
+        _LOGGER.debug(
+            "Warm session with %s expired -- releasing the station", self.duid
+        )
         self._manager._forget_warm(self.duid, self)
         self.transport.close()
         self._manager._mark_session_end(self.duid)
@@ -253,9 +255,7 @@ class StationManager:
 
     # --- Public async API ----------------------------------------------------
 
-    async def async_snapshot(
-        self, device: Device, creds: Credentials
-    ) -> bytes | None:
+    async def async_snapshot(self, device: Device, creds: Credentials) -> bytes | None:
         """Fetch a single JPEG still over one short station session."""
         return await self._hass.async_add_executor_job(
             functools.partial(self._snapshot_sync, device, creds)
@@ -570,7 +570,9 @@ class StationManager:
             and transport.device_ready.is_set()
             and transport.is_alive
         ):
-            _LOGGER.info("Handing the open session over from the %s to the unlock", what)
+            _LOGGER.info(
+                "Handing the open session over from the %s to the unlock", what
+            )
             slot.keep_warm = True
             return
         # Not handed over and not kept warm: close now and record the session end
@@ -712,8 +714,10 @@ class StationManager:
                 )
                 transport.run_until(
                     deadline,
-                    until=lambda: self._unlock_pending(device.duid)
-                    or bool(should_stop and should_stop()),
+                    until=lambda: (
+                        self._unlock_pending(device.duid)
+                        or bool(should_stop and should_stop())
+                    ),
                 )
             except TransportError:
                 _LOGGER.debug("Station %s closed the live stream", device.duid)

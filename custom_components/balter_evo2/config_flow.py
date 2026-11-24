@@ -151,9 +151,7 @@ class BalterEvo2ConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors["base"] = "cannot_connect_lan"
             else:
                 duid = user_input["device"]
-                device = next(
-                    (d for d in self._devices if d.get("duid") == duid), None
-                )
+                device = next((d for d in self._devices if d.get("duid") == duid), None)
                 title = device.get("name") if device else self._login[CONF_EMAIL]
                 return self.async_create_entry(
                     title=title or self._login[CONF_EMAIL],
@@ -187,9 +185,7 @@ class BalterEvo2ConfigFlow(ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_HOST, default=""): str,
             }
         )
-        return self.async_show_form(
-            step_id="device", data_schema=schema, errors=errors
-        )
+        return self.async_show_form(step_id="device", data_schema=schema, errors=errors)
 
     # ------------------------------------------------------- reconfigure step
 
@@ -331,9 +327,7 @@ class BalterEvo2OptionsFlow(OptionsFlow):
                 ),
                 vol.Optional(
                     CONF_SNAPSHOT_TTL,
-                    default=float(
-                        current.get(CONF_SNAPSHOT_TTL, DEFAULT_SNAPSHOT_TTL)
-                    ),
+                    default=float(current.get(CONF_SNAPSHOT_TTL, DEFAULT_SNAPSHOT_TTL)),
                 ): selector.NumberSelector(
                     selector.NumberSelectorConfig(
                         min=0,

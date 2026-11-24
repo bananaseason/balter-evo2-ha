@@ -84,7 +84,9 @@ def test_udp_builders_are_gone(name: str) -> None:
     assert not hasattr(p, name)
 
 
-def test_capture_has_no_udp_markers(handshake_client: bytes, station_head: bytes) -> None:
+def test_capture_has_no_udp_markers(
+    handshake_client: bytes, station_head: bytes
+) -> None:
     for blob in (handshake_client, station_head):
         assert b"\xff\xff\xff\xff" not in blob
         assert b"\xc1\xef\xab\xff" not in blob
@@ -123,7 +125,9 @@ def test_cbc_matches_reference_openssl_style_vector() -> None:
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
     expected = (
-        Cipher(algorithms.AES(TEST_KEY), modes.CBC(b"0" * 16)).encryptor().update(bytes(16))
+        Cipher(algorithms.AES(TEST_KEY), modes.CBC(b"0" * 16))
+        .encryptor()
+        .update(bytes(16))
     )
     assert p.cbc_encrypt(bytes(16), TEST_KEY) == expected
 
@@ -157,7 +161,9 @@ def test_keepalive_differs_per_key() -> None:
 
 def test_ctrl_frame_head_layout() -> None:
     payload = b"hello"
-    frame = p.ctrl_frame(0x0B, 0x01020304, payload, TEST_KEY, msg13=7, b14=9, f15=1, f16=1, b17=3)
+    frame = p.ctrl_frame(
+        0x0B, 0x01020304, payload, TEST_KEY, msg13=7, b14=9, f15=1, f16=1, b17=3
+    )
     head = p.cbc_decrypt(frame[:32], TEST_KEY)
     assert head[0] == 0x0B
     assert struct.unpack_from("<I", head, 1)[0] == 0x01020304
@@ -226,7 +232,9 @@ def test_open_payload_layout() -> None:
 # --- capture ciphertext properties (no key needed) -----------------------------------------------
 
 
-def test_capture_contains_repeating_keepalive_ciphertext(handshake_client: bytes) -> None:
+def test_capture_contains_repeating_keepalive_ciphertext(
+    handshake_client: bytes,
+) -> None:
     """A constant keepalive under a zero IV repeats byte for byte in the capture."""
     body = handshake_client[32:]
     blocks: dict[bytes, int] = {}
@@ -267,7 +275,9 @@ def _decrypted_head(frame: bytes) -> bytes:
 
 
 @pytest.mark.parametrize("size", [0, 1, 200, 223, 224, 800, 4000])
-def test_ctrl_frame_roundtrips_through_parse_head_and_control_payload(size: int) -> None:
+def test_ctrl_frame_roundtrips_through_parse_head_and_control_payload(
+    size: int,
+) -> None:
     payload = bytes((i * 7 + 3) % 256 for i in range(size))
     frame = p.ctrl_frame(0xFE, 0x01020304, payload, TEST_KEY, msg13=18)
     head = p.parse_head(_decrypted_head(frame))
@@ -292,7 +302,9 @@ def test_ctrl_frame_roundtrips_through_parse_head_and_control_payload(size: int)
 def test_ctrl_frame_length_fields_are_16_bit_little_endian() -> None:
     frame = p.ctrl_frame(0xFE, 0, bytes(800), TEST_KEY, msg13=18)
     head = _decrypted_head(frame)
-    assert struct.unpack_from("<H", head, 9)[0] == 832  # 800 + 32 = 832, already aligned
+    assert (
+        struct.unpack_from("<H", head, 9)[0] == 832
+    )  # 800 + 32 = 832, already aligned
     assert struct.unpack_from("<H", head, 11)[0] == 800
     assert head[13] == 18
     assert not any(head[17:32])  # the head's tail stays zero
@@ -418,7 +430,9 @@ def test_parse_head_rejects_a_wrongly_decrypted_head() -> None:
 def test_parse_media_keyframe() -> None:
     data = make_h264_keyframe()
     packet = p.parse_media(
-        build_media_packet(p.MEDIA_KEYFRAME, data, seconds=1000, millis=250, width=768, height=432)
+        build_media_packet(
+            p.MEDIA_KEYFRAME, data, seconds=1000, millis=250, width=768, height=432
+        )
     )
     assert packet == p.MediaPacket(p.MEDIA_KEYFRAME, 1000.25, 768, 432, data)
     assert packet.is_video and packet.is_keyframe
@@ -427,7 +441,9 @@ def test_parse_media_keyframe() -> None:
 def test_parse_media_delta_frame() -> None:
     data = make_h264_pframe()
     packet = p.parse_media(
-        build_media_packet(p.MEDIA_VIDEO, data, seconds=5, millis=999, width=352, height=288)
+        build_media_packet(
+            p.MEDIA_VIDEO, data, seconds=5, millis=999, width=352, height=288
+        )
     )
     assert packet == p.MediaPacket(p.MEDIA_VIDEO, 5.999, 352, 288, data)
     assert packet.is_video and not packet.is_keyframe
@@ -435,7 +451,9 @@ def test_parse_media_delta_frame() -> None:
 
 def test_parse_media_audio() -> None:
     data = make_audio_chunk()
-    packet = p.parse_media(build_media_packet(p.MEDIA_AUDIO, data, seconds=7, millis=40))
+    packet = p.parse_media(
+        build_media_packet(p.MEDIA_AUDIO, data, seconds=7, millis=40)
+    )
     assert packet == p.MediaPacket(p.MEDIA_AUDIO, 7.04, 0, 0, data)
     assert not packet.is_video and not packet.is_keyframe
 
@@ -507,4 +525,7 @@ def test_video_stream_without_keyframe_is_empty() -> None:
 
 
 def test_video_stream_accepts_an_iterator() -> None:
-    assert p.video_stream(iter([_pkt(p.MEDIA_KEYFRAME, b"K"), _pkt(p.MEDIA_VIDEO, b"d")])) == b"Kd"
+    assert (
+        p.video_stream(iter([_pkt(p.MEDIA_KEYFRAME, b"K"), _pkt(p.MEDIA_VIDEO, b"d")]))
+        == b"Kd"
+    )

@@ -43,7 +43,10 @@ from custom_components.balter_evo2.const import (
 )
 from custom_components.balter_evo2.station import DoorRejectedError
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("enable_custom_integrations")]
+pytestmark = [
+    pytest.mark.asyncio,
+    pytest.mark.usefixtures("enable_custom_integrations"),
+]
 
 DUID = "duid-one"
 ENTITY_ID = "camera.front_door"
@@ -115,7 +118,9 @@ class FakeManager:
             await asyncio.sleep(self.linger)
         return emitted
 
-    async def async_record_clip(self, device: Any, creds: Any, seconds: float) -> bytes | None:
+    async def async_record_clip(
+        self, device: Any, creds: Any, seconds: float
+    ) -> bytes | None:
         self.clip_calls.append(seconds)
         return self.clip
 
@@ -197,7 +202,9 @@ def setup_camera(
         return entry
 
     with (
-        patch("custom_components.balter_evo2.BalterEvo2CloudClient", return_value=client),
+        patch(
+            "custom_components.balter_evo2.BalterEvo2CloudClient", return_value=client
+        ),
         patch("custom_components.balter_evo2.StationManager", return_value=manager),
     ):
         yield setup
@@ -272,7 +279,9 @@ async def test_still_is_loaded_from_disk_when_the_entity_is_added(
     await setup_camera()
     state = hass.states.get(ENTITY_ID)
     assert state is not None and state.state == "idle"
-    assert state.attributes["still_taken"] == dt_util.utc_from_timestamp(mtime).isoformat()
+    assert (
+        state.attributes["still_taken"] == dt_util.utc_from_timestamp(mtime).isoformat()
+    )
     assert await entity(hass).async_camera_image() == STILL
 
 
@@ -855,7 +864,11 @@ async def test_record_clip_service_validates_the_length(
         await hass.services.async_call(
             DOMAIN,
             "record_clip",
-            {"entity_id": ENTITY_ID, "filename": str(tmp_path / "c.mp4"), "seconds": seconds},
+            {
+                "entity_id": ENTITY_ID,
+                "filename": str(tmp_path / "c.mp4"),
+                "seconds": seconds,
+            },
             blocking=True,
         )
 
@@ -882,7 +895,11 @@ async def test_record_clip_service_without_video_raises_and_writes_nothing(
 
 def _lock_entity_id(hass: HomeAssistant) -> str:
     reg = er.async_get(hass)
-    ids = [e.entity_id for e in reg.entities.values() if e.platform == DOMAIN and e.domain == "lock"]
+    ids = [
+        e.entity_id
+        for e in reg.entities.values()
+        if e.platform == DOMAIN and e.domain == "lock"
+    ]
     assert len(ids) == 1
     return ids[0]
 
@@ -926,7 +943,12 @@ async def test_an_acked_unlock_flips_the_state_without_a_notification(
         ({"snapshot_ttl": 120, "warm_idle": 5}, {"snapshot_ttl": 120, "warm_idle": 5}),
         ({"snapshot_ttl": 90, "warm_idle": 5}, {"warm_idle": 5}),
         (
-            {"snapshot_ttl": 120, "warm_idle": 10, "stream_duration": 90, "door_pin": "1234"},
+            {
+                "snapshot_ttl": 120,
+                "warm_idle": 10,
+                "stream_duration": 90,
+                "door_pin": "1234",
+            },
             {"snapshot_ttl": 120, "stream_duration": 90, "door_pin": "1234"},
         ),
     ],
@@ -976,4 +998,6 @@ async def test_removing_the_entry_deletes_only_its_own_stills(
     await hass.config_entries.async_remove(entry.entry_id)
     await hass.async_block_till_done()
     assert not os.path.exists(storage)
-    assert os.path.exists(other) and os.path.exists(unrelated) and os.path.exists(legacy)
+    assert (
+        os.path.exists(other) and os.path.exists(unrelated) and os.path.exists(legacy)
+    )

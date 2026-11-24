@@ -122,9 +122,7 @@ class BalterEvo2DoorLock(CoordinatorEntity[BalterEvo2Coordinator], LockEntity):
             # Without a configured PIN, use the cloud out-auth-code: verified that
             # out_auth_code == SHA256(<door PIN>), so the device gets the same hash
             # either way.
-            pin_sha256 = (
-                None if self._pin else (creds.out_auth_code or None)
-            )
+            pin_sha256 = None if self._pin else (creds.out_auth_code or None)
 
             # The station refuses a wrong PIN (see DoorRejectedError below). The
             # cloud knows the right hash, so a mismatch is already visible here.

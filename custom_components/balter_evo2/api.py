@@ -206,7 +206,9 @@ class BalterEvo2CloudClient:
 
     async def _relogin(self, context: str, reason: str) -> None:
         """Discard the current session and authenticate again."""
-        _LOGGER.debug("%s: cloud session invalid (%s) -- logging in again", context, reason)
+        _LOGGER.debug(
+            "%s: cloud session invalid (%s) -- logging in again", context, reason
+        )
         self._server_session = None
         # The userapp endpoint moves per account/time; after losing a session
         # resolve it again instead of reusing a possibly stale host.
@@ -233,7 +235,9 @@ class BalterEvo2CloudClient:
     def _cookie_from_jar(self) -> str | None:
         """Return the session cookie aiohttp stored for the current endpoint."""
         with contextlib.suppress(AttributeError, TypeError):
-            for name, morsel in self._session.cookie_jar.filter_cookies(self._base).items():
+            for name, morsel in self._session.cookie_jar.filter_cookies(
+                self._base
+            ).items():
                 if name.lower() == "jsessionid":
                     return morsel.value
         return None
@@ -309,7 +313,10 @@ class BalterEvo2CloudClient:
             async with self._session.get(
                 f"https://{DISCOVERY_HOST}{DISCOVERY_PATH}",
                 data=body.encode("utf-8"),
-                headers={"Host": DISCOVERY_HOST, "Content-Type": "application/xml;charset=utf-8"},
+                headers={
+                    "Host": DISCOVERY_HOST,
+                    "Content-Type": "application/xml;charset=utf-8",
+                },
                 ssl=self._ssl,
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
             ) as resp:
@@ -327,7 +334,9 @@ class BalterEvo2CloudClient:
                     _LOGGER.debug("Resolved userapp endpoint: %s", self._base)
                 break
         except (aiohttp.ClientError, BalterEvo2ApiError, TimeoutError) as err:
-            _LOGGER.debug("Userapp discovery failed, using fallback %s: %s", self._base, err)
+            _LOGGER.debug(
+                "Userapp discovery failed, using fallback %s: %s", self._base, err
+            )
 
     # --------------------------------------------------------------- bootstrap
 
@@ -390,7 +399,9 @@ class BalterEvo2CloudClient:
                         f"Login HTTP {resp.status}: {_scrub(text, 300)}"
                     )
         except (aiohttp.ClientError, TimeoutError) as err:
-            raise BalterEvo2ApiError(f"Login could not reach {self._base}: {err}") from err
+            raise BalterEvo2ApiError(
+                f"Login could not reach {self._base}: {err}"
+            ) from err
 
         root = self._safe_parse_xml(text, "login")
         result = self._xml_text(root, "./header/result", "-1")
@@ -398,7 +409,9 @@ class BalterEvo2CloudClient:
             raise BalterEvo2AuthError(f"Login rejected by server (result={result})")
         self._server_session = self._xml_text(root, "./header/session/id", "")
         if not self._jsessionid:
-            raise BalterEvo2ApiError("Login succeeded but no session cookie was returned")
+            raise BalterEvo2ApiError(
+                "Login succeeded but no session cookie was returned"
+            )
 
     # ------------------------------------------------------------- device list
 
@@ -454,7 +467,9 @@ class BalterEvo2CloudClient:
         root = self._safe_parse_xml(text, "get-device-list")
         result = self._xml_text(root, "./header/result", "0")
         if result != "0":
-            raise BalterEvo2ApiError(f"get-device-list rejected by server (result={result})")
+            raise BalterEvo2ApiError(
+                f"get-device-list rejected by server (result={result})"
+            )
 
         devices = []
         for dev in root.findall("./content/device"):
@@ -527,7 +542,9 @@ class BalterEvo2CloudClient:
 
         result = (data.get("header") or {}).get("result", 0)
         if result not in (0, "0"):
-            raise BalterEvo2ApiError(f"get-subdev-list rejected by server (result={result})")
+            raise BalterEvo2ApiError(
+                f"get-subdev-list rejected by server (result={result})"
+            )
 
         locks = []
         for entry in data.get("content", []):
@@ -561,7 +578,11 @@ class BalterEvo2CloudClient:
     # --------------------------------------------------------------- helpers
 
     async def get_device_credentials(
-        self, duid: str, max_age: float = CREDENTIAL_MAX_AGE, *, allow_stale: bool = False
+        self,
+        duid: str,
+        max_age: float = CREDENTIAL_MAX_AGE,
+        *,
+        allow_stale: bool = False,
     ) -> dict[str, str]:
         """Return the rotating per-device secrets, refreshed from the cloud.
 
@@ -607,7 +628,9 @@ class BalterEvo2CloudClient:
                     (time.time() - cached[0]) / 60,
                 )
                 return cached[1]
-            _LOGGER.warning("Could not refresh device credentials for %s: %s", duid, err)
+            _LOGGER.warning(
+                "Could not refresh device credentials for %s: %s", duid, err
+            )
             return _empty_credentials()
 
         refreshed = self._cred_cache.get(duid)
