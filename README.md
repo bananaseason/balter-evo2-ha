@@ -54,7 +54,7 @@ polling it would lock out the phone app, so this one does not:
 | Situation | What the entity does | Station contacted |
 | --- | --- | --- |
 | A dashboard shows the camera | serves the stored still (the last frame of the latest live view) | no (once, right after installing, to get a first still) |
-| Somebody opens the camera (more-info, a `camera_view: live` card) | starts a live view, ends it shortly after the last viewer left, at the latest after the *live view length* (90 s by default) | yes, for that time |
+| Somebody opens the camera (more-info, a `camera_view: live` card) | starts a live view, ends it a second after the last viewer left, at the latest after the *live view length* (90 s by default) | yes, for that time |
 | `balter_evo2.start_live_view` is called | runs a live view for its full length whether or not anybody watches | yes, for that time |
 | `balter_evo2.refresh_snapshot` is called | fetches one fresh still (about half a second) | yes, briefly |
 | Home Assistant restarts | brings the stored still back from disk | no |

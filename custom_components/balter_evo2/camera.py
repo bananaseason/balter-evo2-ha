@@ -75,8 +75,9 @@ _LOGGER = logging.getLogger(__name__)
 STILL_RETRY_AFTER = 60.0
 
 # A live view somebody opened by looking at it ends this long after the last
-# viewer left (long enough to survive a dialog/card switch in the frontend).
-UNWATCHED_GRACE = 4.0
+# viewer left: the station is to be released at once, the second only bridges a
+# frontend that re-opens the feed while it rearranges its page.
+UNWATCHED_GRACE = 1.0
 
 # Upper bound of one wait for the next live frame; only a liveness check, the
 # viewers are woken by the frames themselves.

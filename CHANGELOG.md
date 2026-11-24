@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.1.1 (2026-11-24)
+
+### Changed
+
+- A live view that somebody opened now ends one second after the last viewer closed it
+  (was four), so the station is free again practically at once.
+
+### Notes
+
+- Every open MJPEG feed counts as a viewer. If a live view keeps running after you closed
+  it, something else is still showing the feed: typically a wall tablet or a second
+  dashboard with a `camera_view: live` card. Show the live card only on demand (see the
+  README).
+
 ## 1.1.0 (2026-11-24)
 
 The first version that was run against a real station for longer than a snapshot. It
