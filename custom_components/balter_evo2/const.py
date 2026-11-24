@@ -102,6 +102,32 @@ ATTR_END_WHEN_UNWATCHED = "end_when_unwatched"
 STREAM_DURATION_MIN = 10.0
 STREAM_DURATION_MAX = 300.0
 
+# --- Call screen (Lovelace card + websocket API) -------------------------------
+
+# A call is the live view the call card holds while it is on screen. It exists
+# only while the card sends a heartbeat: none for this long ends it, which is
+# what releases the station when the phone app goes to the background (its open
+# MJPEG connection is no sign that anybody watches).
+CALL_HEARTBEAT_TIMEOUT = 3.0
+# Longest call; the card may extend it this many times by the same length.
+CALL_MAX_DURATION = 180.0
+CALL_MAX_EXTENSIONS = 2
+# The live view of a call ends this long after the last call left, whoever
+# started it (an automation's view that somebody answered included); the second
+# lets "Call again" or a second card take it over without a new station session.
+# Hard cap: a call that joins a view late gets only what is left of it (the
+# countdown on the card says so).
+CALL_RELEASE_GRACE = 1.0
+# Hard cap of one live view: the longest call (with its extensions) plus the
+# time to connect. The view's own length or the call's limit end it earlier.
+LIVE_VIEW_HARD_CAP = max(
+    STREAM_DURATION_MAX, CALL_MAX_DURATION * (1 + CALL_MAX_EXTENSIONS) + 30.0
+)
+
+# The call card: served from the integration and loaded on every frontend page.
+CARD_URL = f"/{DOMAIN}/balter-evo2-call-card.js"
+CARD_FILE = "frontend/balter-evo2-call-card.js"
+
 # --- Session slot management ----------------------------------------------------
 
 # The station serves only ONE app session at a time. Snapshot, live stream and

@@ -8,6 +8,15 @@ session at a time -- the phone app and the indoor monitor included:
 * a **live view** runs only on demand -- when somebody opens the camera, or an
   automation calls ``balter_evo2.start_live_view`` (e.g. on a doorbell ring) --
   and always ends by itself after the configured duration;
+* a **call** of the call card (see :mod:`call`) holds the live view while the
+  card heartbeats; the view then ends shortly after the last call, whatever
+  MJPEG connections are still open (a phone app in the background keeps reading
+  its feed) and whoever started it -- a view somebody answered is over when
+  they hang up;
+* a view that only an MJPEG feed opened (more-info, a ``camera_view: live``
+  card) ends when the last feed closes or after the configured duration. An open
+  feed is weak proof that anybody still looks (the phone app keeps reading it in
+  the background), which is why the call card holds its views by heartbeat;
 * nothing holds the station between those moments.
 
 The transport and session handling live in :mod:`station`; the rotating secrets
@@ -25,12 +34,12 @@ import socket
 import threading
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Protocol
 
 import voluptuous as vol
 from aiohttp import web
 from homeassistant.components.camera import Camera, CameraEntityFeature
-from homeassistant.core import HomeAssistant, SupportsResponse
+from homeassistant.core import HomeAssistant, SupportsResponse, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_platform
@@ -46,11 +55,13 @@ from .const import (
     ATTR_END_WHEN_UNWATCHED,
     ATTR_FILENAME,
     ATTR_SECONDS,
+    CALL_RELEASE_GRACE,
     CONF_SNAPSHOT_TTL,
     CONF_STREAM_DURATION,
     DEFAULT_SNAPSHOT_TTL,
     DEFAULT_STREAM_DURATION,
     DOMAIN,
+    LIVE_VIEW_HARD_CAP,
     MANUFACTURER,
     RECORD_CLIP_MAX_SECONDS,
     RECORD_CLIP_MIN_SECONDS,
@@ -64,7 +75,14 @@ from .const import (
 )
 from .coordinator import BalterEvo2Coordinator
 from .models import Device
-from .station import StationManager
+from .station import (
+    FAILURE_BUSY,
+    FAILURE_NO_CREDENTIALS,
+    FAILURE_NO_FFMPEG,
+    FAILURE_UNREACHABLE,
+    StationManager,
+)
+from .transport import TcpTalkChannel
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -88,6 +106,11 @@ FRAME_WAIT = 1.0
 # station, for the whole live view length.
 VIEWER_STALL_TIMEOUT = 2.0
 
+# A call is ended this long before the hard cap of its live view (see
+# ``view_hard_end``), so it is the call's own limit the card sees, never the
+# view breaking off under it.
+VIEW_END_MARGIN = 1.0
+
 # Send buffer of a viewer's connection. The operating system would otherwise
 # queue seconds of video for a viewer that stopped reading before a write
 # blocks, and the stall above would be noticed that much later.
@@ -97,6 +120,32 @@ VIEWER_SEND_BUFFER = 32 * 1024
 # (async_get_still_stream), which every frontend and app is known to show.
 MJPEG_BOUNDARY = "--frameboundary"
 MJPEG_CONTENT_TYPE = f"multipart/x-mixed-replace;boundary={MJPEG_BOUNDARY}"
+
+
+class CallListener(Protocol):
+    """A call holding a live view (see :mod:`call`); told when it goes live or ends."""
+
+    def call_live(self) -> None:
+        """The live view shows the station's picture."""
+
+    def call_ended(self, reason: str, message: str | None) -> None:
+        """The live view ended by itself: ``timeout``, ``station_busy`` or ``error``."""
+
+
+# Why a live view never showed a picture -> (call end reason, message).
+_FAILURE_REASONS: dict[str | None, tuple[str, str | None]] = {
+    FAILURE_BUSY: ("station_busy", None),
+    FAILURE_UNREACHABLE: (
+        "error",
+        "The door station did not answer. It may be offline or its address changed.",
+    ),
+    FAILURE_NO_CREDENTIALS: (
+        "error",
+        "The cloud gave no access secrets for the door station.",
+    ),
+    FAILURE_NO_FFMPEG: ("error", "ffmpeg is missing on the Home Assistant host."),
+    None: ("error", "The door station sent no video."),
+}
 
 
 def _mjpeg_part(jpeg: bytes) -> bytes:
@@ -250,6 +299,18 @@ class BalterEvo2Camera(CoordinatorEntity[BalterEvo2Coordinator], Camera):
         # service (doorbell automation) runs its full duration.
         self._viewer_owned = False
         self._unwatched_handle: asyncio.TimerHandle | None = None
+        # Calls of the call card holding the live view (call id -> listener).
+        # While one exists the view runs whatever its length says; the call
+        # manager bounds every call. ``_call_owned``: the view exists because of
+        # the calls (no automation holds it), so it ends shortly after the last
+        # call left -- MJPEG viewers never keep such a view alive.
+        self._calls: dict[str, CallListener] = {}
+        self._call_owned = False
+        self._call_release_handle: asyncio.TimerHandle | None = None
+        # Whether the running view has shown a picture (calls were told so).
+        self._live_announced = False
+        # When the running view started (wall clock), for its hard cap.
+        self._view_started = 0.0
 
     async def async_added_to_hass(self) -> None:
         """Bring back the stored still, so a restart does not blank the card."""
@@ -314,6 +375,99 @@ class BalterEvo2Camera(CoordinatorEntity[BalterEvo2Coordinator], Camera):
     def _wake_viewers(self) -> None:
         event, self._frame_event = self._frame_event, asyncio.Event()
         event.set()
+        if not self._live_announced and self._streaming and self._live_jpeg is not None:
+            self._live_announced = True
+            for listener in list(self._calls.values()):
+                listener.call_live()
+
+    # --- Calls (call card) -------------------------------------------------------
+
+    @property
+    def is_call_live(self) -> bool:
+        """Return whether a live view runs and has shown a picture."""
+        return self._streaming and self._live_announced
+
+    @property
+    def view_hard_end(self) -> float | None:
+        """Return until when a call may hold the running view (epoch s), else None.
+
+        That is the view's hard cap counted from its start, less
+        :data:`VIEW_END_MARGIN`; the station's own count starts later still
+        (after the login), so the calls end first.
+        """
+        if not self._streaming:
+            return None
+        return self._view_started + LIVE_VIEW_HARD_CAP - VIEW_END_MARGIN
+
+    async def async_wait_ready(self) -> None:
+        """Let a live view that is on its way out finish before a call joins."""
+        await self._async_wait_if_stopping()
+
+    @callback
+    def call_join(self, call_id: str, listener: CallListener) -> None:
+        """Let a call hold the live view, starting one if none runs.
+
+        Call :meth:`async_wait_ready` first. Whoever started the running view --
+        an MJPEG viewer or an automation (the doorbell recipe) -- it is the
+        calls' view from now on: it ends shortly after the last call left, not
+        with the viewers and not at its own length. Somebody answered; when they
+        hang up the station is to be free again.
+        """
+        self._cancel_call_release()
+        self._calls[call_id] = listener
+        self._viewer_owned = False
+        self._call_owned = True
+        self._cancel_unwatched_stop()
+        if self._streaming:
+            if self._live_announced:
+                listener.call_live()
+            return
+        self._start_stream()
+
+    @callback
+    def call_leave(self, call_id: str) -> None:
+        """Release the hold of a call; the calls' view ends shortly after the last."""
+        if self._calls.pop(call_id, None) is None:
+            return
+        if self._calls or not self._streaming or not self._call_owned:
+            # An automation took the view over within the release grace: it
+            # runs on until its own end.
+            return
+        self._cancel_call_release()
+        self._call_release_handle = self.hass.loop.call_later(
+            CALL_RELEASE_GRACE, self._release_after_calls
+        )
+
+    def _release_after_calls(self) -> None:
+        self._call_release_handle = None
+        if not self._calls and self._streaming and self._call_owned:
+            _LOGGER.debug(
+                "The last call of %s ended -- ending the live view", self._duid
+            )
+            self._request_stop()
+
+    def _cancel_call_release(self) -> None:
+        if self._call_release_handle is not None:
+            self._call_release_handle.cancel()
+            self._call_release_handle = None
+
+    def add_station_audio_listener(
+        self, listener: Callable[[bytes], None]
+    ) -> Callable[[], None]:
+        """Receive the station's audio during live views (from a worker thread)."""
+        return self._manager.add_audio_listener(self._duid, listener)
+
+    async def async_open_talk(self) -> TcpTalkChannel:
+        """Open the talk-back channel of the running live view.
+
+        It logs in with the secrets the live view's session logged in with: no
+        trip to the cloud between the tap on the microphone and talking.
+        """
+        return await self._manager.async_open_talk(self._device)
+
+    async def async_close_talk(self, channel: TcpTalkChannel) -> None:
+        """Close a talk-back channel opened by :meth:`async_open_talk`."""
+        await self._manager.async_close_talk(self._duid, channel)
 
     async def async_start_live_view(
         self, duration: float | None = None, end_when_unwatched: bool = False
@@ -326,15 +480,27 @@ class BalterEvo2Camera(CoordinatorEntity[BalterEvo2Coordinator], Camera):
         calls. With ``end_when_unwatched`` it also ends shortly after the last
         viewer closed the picture, which suits a dashboard button. A view that is
         already running is kept and runs at least ``duration`` longer; one that
-        was started without that flag keeps running in full.
+        was started without that flag keeps running in full. While a call holds
+        the view it stays the calls' view: it ends when they hang up.
         """
         await self._async_wait_if_stopping()
-        if self._streaming:
+        if self._calls:
+            # Somebody is on a call (e.g. the doorbell rang while the owner was
+            # already looking): the station is free again when they hang up.
+            self._viewer_owned = False
+            self._call_owned = True
+        elif self._streaming:
             self._viewer_owned = self._viewer_owned and end_when_unwatched
+            # Without the flag the automation holds the view: it runs its
+            # length even after a call on it ended within the release grace.
+            self._call_owned = self._call_owned and end_when_unwatched
         else:
             self._viewer_owned = end_when_unwatched
+            self._call_owned = False
         if not self._viewer_owned:
             self._cancel_unwatched_stop()
+        if not self._call_owned:
+            self._cancel_call_release()
         self._start_stream(duration, extend=True)
 
     async def async_stop_live_view(self) -> None:
@@ -357,8 +523,12 @@ class BalterEvo2Camera(CoordinatorEntity[BalterEvo2Coordinator], Camera):
         """Return whether the running live view is already on its way out."""
         return self._streaming and (
             (self._stop_event is not None and self._stop_event.is_set())
-            or time.monotonic() >= self._deadline
+            or self._past_deadline()
         )
+
+    def _past_deadline(self) -> bool:
+        """Return whether the view's length ran out (a call holds it beyond)."""
+        return time.monotonic() >= self._deadline and not self._calls
 
     async def _async_wait_if_stopping(self) -> None:
         """Let a live view that is ending finish, so a new one can start."""
@@ -377,8 +547,10 @@ class BalterEvo2Camera(CoordinatorEntity[BalterEvo2Coordinator], Camera):
         stop = threading.Event()
         self._stop_event = stop
         self._deadline = time.monotonic() + length
+        self._view_started = time.time()
         self._streaming = True
         self._live_jpeg = None
+        self._live_announced = False
         self.async_write_ha_state()
         # Background task: Home Assistant does not wait for it on start and
         # cancels it on shutdown.
@@ -390,31 +562,48 @@ class BalterEvo2Camera(CoordinatorEntity[BalterEvo2Coordinator], Camera):
         """Drive one bounded live view and release the station afterwards."""
         _LOGGER.debug("Starting a live view for %s", self._duid)
         cancelled = False
+        frames = 0
+        # Why the view ended, for the calls holding it.
+        reason: str = "timeout"
+        message: str | None = None
         try:
             creds = await self.coordinator.async_credentials(self._duid)
             # The length is enforced through the stop callback so a running view
             # can be prolonged; the manager's own limit is only the hard cap.
-            await self._manager.async_stream(
+            frames = await self._manager.async_stream(
                 self._device,
                 creds,
-                STREAM_DURATION_MAX,
+                LIVE_VIEW_HARD_CAP,
                 self._on_jpeg,
-                lambda: stop.is_set() or time.monotonic() >= self._deadline,
+                lambda: stop.is_set() or self._past_deadline(),
             )
+            if not frames and not self._live_announced:
+                reason, message = _FAILURE_REASONS.get(
+                    self._manager.last_stream_failure(self._duid),
+                    _FAILURE_REASONS[None],
+                )
         except asyncio.CancelledError:
             # Entity removal or shutdown: the executor thread cannot be
             # cancelled, but it reads this flag and lets go of the station.
             cancelled = True
+            reason, message = "error", "Home Assistant stopped the live view."
             raise
         except Exception as err:  # noqa: BLE001 -- surface, never crash the loop
             _LOGGER.warning("Live view for %s failed: %s", self._duid, err)
+            reason, message = "error", str(err) or type(err).__name__
         finally:
             stop.set()
             self._streaming = False
             self._viewer_owned = False
+            self._call_owned = False
             self._live_jpeg = None
             self._cancel_unwatched_stop()
+            self._cancel_call_release()
+            calls = list(self._calls.values())
+            self._calls.clear()
             self._wake_viewers()
+            for listener in calls:
+                listener.call_ended(reason, message)
             if not cancelled:
                 await self._async_store_still()
                 self.async_write_ha_state()
@@ -430,7 +619,7 @@ class BalterEvo2Camera(CoordinatorEntity[BalterEvo2Coordinator], Camera):
         await self._async_wait_if_stopping()
         if not self._streaming:
             self._viewer_owned = True
-            self._start_stream()
+            self._start_stream(self._stream_duration)
         self._viewers += 1
         self._cancel_unwatched_stop()
         try:
@@ -499,7 +688,12 @@ class BalterEvo2Camera(CoordinatorEntity[BalterEvo2Coordinator], Camera):
 
     def _stop_if_unwatched(self) -> None:
         self._unwatched_handle = None
-        if self._viewers <= 0 and self._streaming and self._viewer_owned:
+        if (
+            self._viewers <= 0
+            and self._streaming
+            and self._viewer_owned
+            and not self._calls
+        ):
             _LOGGER.debug(
                 "Nobody watches %s any more -- ending the live view", self._duid
             )
@@ -593,6 +787,7 @@ class BalterEvo2Camera(CoordinatorEntity[BalterEvo2Coordinator], Camera):
         """Stop any running live view when the entity goes away."""
         self._request_stop()
         self._cancel_unwatched_stop()
+        self._cancel_call_release()
         task = self._stream_task
         self._stream_task = None
         if task is None or task.done():

@@ -10,6 +10,10 @@ sold under brands such as **Balter EVO** and **Homaxi**.
 
 ## Features
 
+- **Call card** for dashboards: a still picture that turns into a door-phone call on a tap —
+  live video, the visitor's voice, your microphone (talk / mute), **Open door** while you
+  talk, hang up. A ring can open it as an incoming call. Loaded automatically, no resource
+  to add (see [The call card](#the-call-card))
 - **Camera** with a stored still image and an on-demand live view (768×432, about 18 frames
   a second) that always ends by itself
 - **Lock** entity for each door opener the station has (an EVO 2 has two: *Door opener* is
@@ -56,6 +60,7 @@ polling it would lock out the phone app, so this one does not:
 | Situation | What the entity does | Station contacted |
 | --- | --- | --- |
 | A dashboard shows the camera | serves the stored still (the last frame of the latest live view) | no (once, right after installing, to get a first still) |
+| Somebody opens the call card | starts a live view with sound; it ends about a second after the call is hung up, and within about three seconds of the phone app going to the background or the screen locking | yes, for that time |
 | Somebody opens the camera (more-info, a `camera_view: live` card) | starts a live view, ends it a second after the last viewer left, at the latest after the *live view length* (90 s by default) | yes, for that time |
 | `balter_evo2.start_live_view` is called | runs a live view for its full length whether or not anybody watches | yes, for that time |
 | `balter_evo2.refresh_snapshot` is called | fetches one fresh still (about half a second) | yes, briefly |
@@ -71,7 +76,42 @@ the live card only on demand, as below. A viewer counts only while it takes the 
 phone app in the background or a sleeping tablet that keeps its connection open without
 reading is dropped after two seconds.
 
-### Dashboard example
+### The call card
+
+The integration ships its own dashboard card and loads it into the frontend by itself:
+
+```yaml
+type: custom:balter-evo2-call-card
+camera_entity: camera.front_door
+lock_entity: lock.front_door_door_opener_2   # the door button (optional)
+ring_entity: input_boolean.doorbell          # "on" = somebody rings (optional)
+name: Front door                             # optional
+```
+
+The card shows the stored still with an **Open** button. A tap opens the call screen:
+
+- the live picture and the visitor's voice (sound on, your microphone **off**);
+- **Mic**: tap to talk, tap again to mute. While it is on, the button, the frame of the
+  picture and the headline turn red;
+- **Open door**: opens at once, no confirmation, and the call goes on;
+- **Hang up** (or Escape): the station is free again about a second later.
+
+When `ring_entity` turns on, every open dashboard with the card shows an incoming call
+(Answer opens the call with the microphone on, Decline dismisses it); turn that off with
+`ring_takeover: false`.
+
+The call is held by the card itself, not by the video: while the call screen is visible it
+tells Home Assistant once a second that it is still there. Close it, switch apps or lock the
+phone, and the call ends within about three seconds even if the phone keeps the video
+connection open. A call lasts three minutes and can be extended twice.
+
+**The microphone needs https.** Browsers give a page the microphone only over a secure
+connection. Open Home Assistant over https; in the Home Assistant phone app set *Settings →
+Companion App → (your server) → Internal URL* to your https address (or clear it). Over plain
+http the call works with picture, sound and the door, and the card says why the microphone
+is not available.
+
+### Other dashboard cards
 
 The simplest card is a plain `picture-entity` with `camera_view: auto`: it shows the still,
 and a tap opens the camera dialog with the live view. If you prefer the picture to turn into

@@ -21,13 +21,22 @@ import secrets
 from collections.abc import Mapping
 from dataclasses import replace
 
-from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
-from homeassistant.core import HomeAssistant
+from homeassistant.components.frontend import add_extra_js_url
+from homeassistant.components.http import StaticPathConfig
+from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers import aiohttp_client
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.storage import STORAGE_DIR
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.loader import async_get_integration
 
+from . import websocket
 from .api import BalterEvo2CloudClient
+from .call import DATA_CALLS, CallManager
 from .const import (
+    CARD_FILE,
+    CARD_URL,
     CONF_CLIENT_ID,
     CONF_HOST,
     CONF_SNAPSHOT_TTL,
@@ -51,6 +60,38 @@ _LOGGER = logging.getLogger(__name__)
 __all__ = ["BalterEvo2ConfigEntry"]
 
 HEX16 = re.compile(r"^[0-9a-f]{16}$")
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up what serves every entry: the call card and its websocket API."""
+    if DATA_CALLS in hass.data:
+        return True
+    manager = hass.data[DATA_CALLS] = CallManager(hass)
+    websocket.async_register(hass)
+
+    @callback
+    def _stop(_event: Event) -> None:
+        manager.end_all()
+
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _stop)
+    await _async_register_card(hass)
+    return True
+
+
+async def _async_register_card(hass: HomeAssistant) -> None:
+    """Serve the call card and load it on every frontend page.
+
+    The version in the URL makes browsers and the phone app fetch the card anew
+    after an update of the integration.
+    """
+    integration = await async_get_integration(hass, DOMAIN)
+    path = os.path.join(os.path.dirname(__file__), CARD_FILE)
+    await hass.http.async_register_static_paths(
+        [StaticPathConfig(CARD_URL, path, cache_headers=False)]
+    )
+    add_extra_js_url(hass, f"{CARD_URL}?v={integration.version}")
 
 
 def _client_identity(hass: HomeAssistant, entry: BalterEvo2ConfigEntry) -> str:

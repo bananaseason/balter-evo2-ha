@@ -372,7 +372,7 @@ def test_parse_head_accepts_an_unknown_type_as_a_control_frame(ftype: int) -> No
 
 
 def test_known_ftypes() -> None:
-    assert p.KNOWN_FTYPES == {0x00, 0x01, 0x07, 0xA0, 0xFE}
+    assert p.KNOWN_FTYPES == {0x00, 0x01, 0x07, 0xA0, 0xFE, 0x0B, 0x0C, 0x0D, 0xA2}
 
 
 @pytest.mark.parametrize("pos", [5, 6, 7, 8])
@@ -537,3 +537,127 @@ def test_video_stream_accepts_an_iterator() -> None:
         p.video_stream(iter([_pkt(p.MEDIA_KEYFRAME, b"K"), _pkt(p.MEDIA_VIDEO, b"d")]))
         == b"Kd"
     )
+
+
+# --- audio channel / talk-back (reference/tools/talk_spike.py) ------------------------
+#
+# The builders below are copied verbatim (re-indented) from the probe that talked to
+# a Balter EVO 2 live on 2026-11-24; the integration's builders must reproduce their
+# bytes exactly. ``P`` stands for the protocol module, ``key`` for the station key.
+
+
+def _spike_head(ftype, ts, enc, clen16=None, clen32=None, msg13=0, b14=0, b15=0, b16=0):
+    h = bytearray(32)
+    h[0] = ftype
+    struct.pack_into("<I", h, 1, ts)
+    struct.pack_into("<H", h, 9, enc)
+    if clen32 is not None:
+        struct.pack_into("<I", h, 11, clen32)
+    else:
+        struct.pack_into("<H", h, 11, clen16)
+        h[13] = msg13
+        h[14] = b14
+        h[15] = b15
+        h[16] = b16
+    return bytes(h)
+
+
+def _spike_empty_frame(ftype, ts, msg13, b15=0, b16=0, key=TEST_KEY):
+    h = _spike_head(ftype, ts, 32, clen16=0xFFFF, msg13=msg13, b15=b15, b16=b16)
+    return p.cbc_encrypt(h, key) + p.cbc_encrypt(hashlib.sha256(h).digest(), key)
+
+
+def _spike_talk_frame(ts, alaw, key=TEST_KEY):
+    pl = b"\x00\x00\x01\xf0\x0e\x02" + struct.pack("<H", len(alaw)) + alaw
+    h = _spike_head(0xA2, ts, 32, clen32=len(pl))
+    return p.cbc_encrypt(h, key) + p.cbc_encrypt(pl[:32], key) + pl[32:]
+
+
+def test_audio_channel_setup_body_selects_the_audio_stream() -> None:
+    body = p.build_a9_body(1)
+    assert body[0] == 0xA9 and body[9] == 0x02
+    assert body[:9] == b"\xa9" + bytes(8) and not any(body[10:])
+
+
+def test_audio_login_matches_the_spike() -> None:
+    login = p.build_login_payload(TEST_DYNPW, TEST_CLIENT_ID)
+    spike = p.ctrl_frame(0x0B, 1, login, TEST_KEY, msg13=0xFF, b14=0xFF)
+    ours = p.audio_login_frame(1, TEST_DYNPW, TEST_CLIENT_ID, TEST_OEM, TEST_KEY)
+    assert ours == spike
+    head = p.cbc_decrypt(ours[:32], TEST_KEY)
+    assert head[0] == 0x0B and head[13] == 0xFF and head[14] == 0xFF
+    ftype, msg13, payload, total = parse_ctrl_frame(ours, TEST_KEY)
+    assert (ftype, msg13, payload, total) == (0x0B, 0xFF, login, len(ours))
+
+
+def test_audio_format_and_idle_frames_match_the_spike() -> None:
+    assert p.audio_format_frame(2, TEST_KEY) == _spike_empty_frame(
+        0x0C, 2, 1, b15=0x40, b16=0x1F
+    )
+    assert p.talk_state_frame(2, False, TEST_KEY) == _spike_empty_frame(0x0D, 2, 1)
+
+
+def test_talk_start_and_stop_match_the_spike() -> None:
+    assert p.talk_state_frame(3, True, TEST_KEY) == _spike_empty_frame(0x0D, 3, 0)
+    assert p.talk_state_frame(200, False, TEST_KEY) == _spike_empty_frame(0x0D, 200, 1)
+
+
+def test_empty_frame_layout() -> None:
+    frame = p.empty_frame(0x0C, 7, 1, TEST_KEY, b15=0x40, b16=0x1F)
+    assert len(frame) == 64
+    head = p.cbc_decrypt(frame[:32], TEST_KEY)
+    assert head[0] == 0x0C
+    assert struct.unpack_from("<I", head, 1)[0] == 7
+    assert struct.unpack_from("<H", head, 9)[0] == 32  # encrypted bytes after the head
+    assert struct.unpack_from("<H", head, 11)[0] == 0xFFFF  # "no payload"
+    assert head[13] == 1 and head[15:17] == b"\x40\x1f"  # 8000 Hz
+    assert struct.unpack_from("<H", head, 15)[0] == p.TALK_SAMPLE_RATE == 8000
+    assert p.cbc_decrypt(frame[32:], TEST_KEY) == hashlib.sha256(head).digest()
+
+
+@pytest.mark.parametrize("ts", [4, 5, 123, 0xFFFFFFFF])
+def test_talk_frame_matches_the_spike(ts: int) -> None:
+    silence = b"\xd5" * 320
+    assert p.talk_frame(ts, silence, TEST_KEY) == _spike_talk_frame(ts, silence)
+    voice = make_audio_chunk(ts % 251, 320)
+    assert p.talk_frame(ts, voice, TEST_KEY) == _spike_talk_frame(ts, voice)
+
+
+def test_talk_frame_layout() -> None:
+    alaw = make_audio_chunk(9, p.TALK_FRAME_BYTES)
+    frame = p.talk_frame(4, alaw, TEST_KEY)
+    assert len(frame) == 32 + 8 + 320
+    head = p.cbc_decrypt(frame[:32], TEST_KEY)
+    assert head[0] == p.FTYPE_TALK_AUDIO == 0xA2
+    assert struct.unpack_from("<H", head, 9)[0] == 32
+    assert struct.unpack_from("<I", head, 11)[0] == 328
+    payload = p.cbc_decrypt(frame[32:64], TEST_KEY) + frame[64:]
+    assert payload[:6] == b"\x00\x00\x01\xf0\x0e\x02"
+    assert struct.unpack_from("<H", payload, 6)[0] == 320
+    assert payload[8:] == alaw
+    assert frame[64:] == alaw[24:]  # only the first 32 payload bytes are encrypted
+    # The strict stream parser walks it like a media frame (u32 length).
+    parsed = p.parse_head(head)
+    assert parsed is not None and parsed.body_len == 328 and not parsed.is_media
+
+
+def test_talk_frame_refuses_audio_shorter_than_one_block() -> None:
+    with pytest.raises(ValueError):
+        p.talk_frame(1, b"\xd5" * 10, TEST_KEY)
+
+
+def test_audio_channel_head_parser() -> None:
+    answer = p.cbc_decrypt(_spike_empty_frame(0x0D, 9, 0)[:32], TEST_KEY)
+    parsed = p.parse_audio_channel_head(answer)
+    assert parsed == p.AudioChannelHead(0x0D, 0, 0xFFFF, 32)
+    talk = p.cbc_decrypt(p.talk_frame(1, b"\xd5" * 320, TEST_KEY)[:32], TEST_KEY)
+    assert p.parse_audio_channel_head(talk) == p.AudioChannelHead(0xA2, 0, 328, 328)
+    # Flag bytes of unknown meaning do not matter here (the strict parser refuses).
+    flagged = bytearray(answer)
+    flagged[20] = 0x55
+    assert p.parse_head(bytes(flagged)) is None
+    assert p.parse_audio_channel_head(bytes(flagged)) is not None
+    bad = bytearray(answer)
+    struct.pack_into("<H", bad, 9, 33)  # not block aligned
+    assert p.parse_audio_channel_head(bytes(bad)) is None
+    assert p.parse_audio_channel_head(b"\x00" * 10) is None

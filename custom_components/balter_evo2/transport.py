@@ -53,22 +53,32 @@ from collections.abc import Callable
 
 from .const import KEEPALIVE_INTERVAL, LOGIN_TIMEOUT, OEM_ID_COMPACT
 from .protocol import (
+    FTYPE_AUDIO_FORMAT,
+    FTYPE_AUDIO_LOGIN,
     FTYPE_CLOSE,
     FTYPE_CONTROL,
     FTYPE_KEEPALIVE,
     FTYPE_LOGIN,
+    FTYPE_TALK,
     HEAD_LEN,
     KNOWN_FTYPES,
+    TALK_FRAME_BYTES,
+    TALK_FRAME_SECONDS,
     MediaPacket,
+    audio_format_frame,
+    audio_login_frame,
     build_a9_body,
     build_login_payload,
     build_open_payload,
     cbc_decrypt,
     control_payload,
     ctrl_frame,
+    parse_audio_channel_head,
     parse_head,
     parse_media,
     session_key,
+    talk_frame,
+    talk_state_frame,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -763,3 +773,470 @@ class TcpStationTransport:
                 self._peer_closed = True
                 self._wake_waiters()
                 return
+
+
+# --- Talk-back: the audio channel ---------------------------------------------
+
+# How long the station gets to answer one frame on the audio channel. It answers
+# within a few tens of milliseconds (live, 2026-11-24).
+TALK_ANSWER_TIMEOUT = 2.0
+
+# Microphone audio waiting to be sent is capped at this many bytes (400 ms of
+# 8 kHz A-law); the oldest is dropped, so a late burst never builds up delay.
+TALK_BUFFER_MAX = 10 * TALK_FRAME_BYTES
+
+# A sender that fell this far behind its 40 ms schedule (a stall of the host)
+# starts a new schedule instead of sending the backlog in one burst.
+TALK_SCHEDULE_SLACK = 2 * TALK_FRAME_SECONDS
+
+
+class TcpTalkChannel:
+    """The audio channel of a running live view: talk-back to the door station.
+
+    A second TCP connection to the station, opened while the video session
+    (connection 1) runs -- verified live on a Balter EVO 2 (2026-11-24,
+    ``reference/tools/talk_spike.py``):
+
+    1. raw ``build_a9_body(1)`` (byte 9 = 2); the station echoes ``a9 .. 02 01``;
+    2. LOGIN ``0x0B`` (msg13 and byte 14 ``0xFF``, the video LOGIN payload); the
+       station answers ``0x0B``;
+    3. the format ``0x0C`` (8000 Hz) and the talk state ``0x0D`` "not talking";
+       the station answers both;
+    4. talking: ``0x0D`` msg13=0, then one ``0xA2`` frame (320 bytes of G.711
+       A-law = 40 ms) every 40 ms; ``0x0D`` msg13=1 ends it. Each ``0x0D`` is
+       answered with a ``0x0D``.
+
+    The station's own audio is not on this channel: it arrives as media packets
+    (kind ``0xE3``) on the video connection. Closing sends ``0x07``.
+
+    Every blocking method belongs in an executor thread; :meth:`feed` only
+    appends to a buffer and may be called from the event loop. A sender thread
+    paces the buffered audio at one frame per 40 ms.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        duid: str,
+        dynamic_password: str,
+        data_encode_key: str | None,
+        client_id: str,
+        oem: str = OEM_ID_COMPACT,
+    ) -> None:
+        """Prepare (but do not open) the audio channel; see :meth:`open`."""
+        self._host = host
+        self._port = port
+        self._duid = duid
+        self._dynamic_password = dynamic_password
+        self._client_id = client_id
+        self._oem = oem
+        self._key = session_key(data_encode_key)
+        # The frame counter of this channel; taken and sent under the send lock
+        # (see :meth:`_send_frame`), so the frames leave in counter order.
+        self._ts = 0
+        self._sock: socket.socket | None = None
+        self._buf = bytearray()
+        self._stop = threading.Event()
+        self._send_lock = threading.Lock()
+        # When the last frame left (time.monotonic()), for the keepalive.
+        self._last_sent = 0.0
+        self._threads: list[threading.Thread] = []
+        self._peer_closed = False
+        self._closed = False
+        self._on_closed: Callable[[], None] | None = None
+        self._closed_reported = False
+
+        # Station answers: (ftype, msg13, content_len) in arrival order.
+        self._answer_cv = threading.Condition()
+        self._answers: list[tuple[int, int, int]] = []
+
+        # Talking state and the microphone audio waiting to be sent.
+        self._audio_cv = threading.Condition()
+        self._talking = False
+        self._pending = bytearray()
+        self.frames_sent = 0
+        self.bytes_dropped = 0
+
+    # --- Properties ----------------------------------------------------------
+
+    @property
+    def duid(self) -> str:
+        """Return the device this channel belongs to."""
+        return self._duid
+
+    @property
+    def is_alive(self) -> bool:
+        """Return whether the channel is open and the station has not left it."""
+        return (
+            not self._closed
+            and not self._stop.is_set()
+            and not self._peer_closed
+            and self._sock is not None
+        )
+
+    @property
+    def talking(self) -> bool:
+        """Return whether microphone audio is being sent."""
+        return self._talking
+
+    def set_close_callback(self, callback: Callable[[], None] | None) -> None:
+        """Call ``callback`` (from a channel thread) once the station drops the channel."""
+        self._on_closed = callback
+
+    def answers(self) -> list[tuple[int, int, int]]:
+        """Return the station's answers so far (for diagnostics and tests)."""
+        with self._answer_cv:
+            return list(self._answers)
+
+    # --- Open ----------------------------------------------------------------
+
+    def open(self, timeout: float = LOGIN_TIMEOUT) -> None:
+        """Connect and run the audio-channel handshake up to "not talking".
+
+        Raises :class:`StationSilentError` when the station cannot be reached or
+        does not echo the setup, :class:`TransportError` when it refuses a step.
+        The channel is closed on failure.
+        """
+        try:
+            self._open(timeout)
+        except TransportError:
+            self.close()
+            raise
+        except (OSError, ValueError) as err:
+            self.close()
+            raise TransportError(
+                f"The audio channel to {self._duid} could not be opened: {err}"
+            ) from err
+
+    def _open(self, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        try:
+            sock = socket.create_connection((self._host, self._port), timeout=timeout)
+        except (TimeoutError, OSError) as err:
+            raise StationSilentError(
+                f"Could not reach the door station at {self._host}:{self._port} "
+                f"for the audio channel: {err}"
+            ) from err
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.settimeout(RX_POLL_TIMEOUT)
+        _quick_ack(sock)
+        self._sock = sock
+
+        self._raw_send(build_a9_body(1))
+        echo = self._recv_exact(32, deadline)
+        if echo is None:
+            raise StationSilentError(
+                f"The door station {self._duid} did not echo the audio setup"
+            )
+        if not all(echo[pos] == val for pos, val in _A9_ECHO_MARKER.items()):
+            raise TransportError(
+                f"The door station {self._duid} refused the audio channel "
+                f"(echo {echo[:12].hex()})"
+            )
+
+        thread = threading.Thread(
+            target=self._rx_loop, name=f"balter_evo2-talk-rx-{self._duid}", daemon=True
+        )
+        self._threads.append(thread)
+        thread.start()
+
+        start = self._answer_count()
+        self._send_frame(
+            lambda ts: audio_login_frame(
+                ts,
+                self._dynamic_password,
+                self._client_id,
+                self._oem,
+                self._key,
+            )
+        )
+        if not self._wait_answer(FTYPE_AUDIO_LOGIN, start, deadline):
+            raise TransportError(
+                f"The door station {self._duid} did not answer the audio LOGIN"
+            )
+        start = self._answer_count()
+        self._send_frame(
+            lambda ts: (
+                audio_format_frame(ts, self._key)
+                + talk_state_frame(ts, False, self._key)
+            )
+        )
+        if not (
+            self._wait_answer(FTYPE_AUDIO_FORMAT, start, deadline)
+            and self._wait_answer(FTYPE_TALK, start, deadline)
+        ):
+            raise TransportError(
+                f"The door station {self._duid} did not accept the audio format"
+            )
+
+        thread = threading.Thread(
+            target=self._send_loop,
+            name=f"balter_evo2-talk-tx-{self._duid}",
+            daemon=True,
+        )
+        self._threads.append(thread)
+        thread.start()
+        _LOGGER.debug("Audio channel to %s is open", self._duid)
+
+    def _recv_exact(self, count: int, deadline: float) -> bytes | None:
+        out = bytearray()
+        while len(out) < count:
+            if time.monotonic() >= deadline or self._sock is None:
+                return None
+            try:
+                chunk = self._sock.recv(count - len(out))
+            except TimeoutError:
+                continue
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            out += chunk
+        return bytes(out)
+
+    # --- Talking ---------------------------------------------------------------
+
+    def set_talking(self, talking: bool) -> bool:
+        """Switch talking on or off; ``True`` once the station answered.
+
+        Off takes effect at once (no more audio leaves), whether or not the
+        station answers; on starts sending only after the station's answer.
+        """
+        if not talking:
+            with self._audio_cv:
+                self._talking = False
+                self._pending.clear()
+        if not self.is_alive:
+            return False
+        start = self._answer_count()
+        try:
+            self._send_frame(lambda ts: talk_state_frame(ts, talking, self._key))
+        except (OSError, TransportError) as err:
+            _LOGGER.debug("Talk state to %s not sent: %s", self._duid, err)
+            self._mark_peer_closed()
+            return False
+        answered = self._wait_answer(
+            FTYPE_TALK, start, time.monotonic() + TALK_ANSWER_TIMEOUT
+        )
+        if not answered:
+            _LOGGER.warning(
+                "The door station %s did not answer the talk %s",
+                self._duid,
+                "start" if talking else "stop",
+            )
+            return False
+        if talking:
+            with self._audio_cv:
+                self._talking = True
+                self._pending.clear()
+                self._audio_cv.notify_all()
+        _LOGGER.debug("Talking to %s %s", self._duid, "on" if talking else "off")
+        return True
+
+    def feed(self, alaw: bytes) -> int:
+        """Queue microphone audio (G.711 A-law, 8 kHz); return the bytes dropped.
+
+        Audio is dropped while not talking. The queue keeps at most
+        :data:`TALK_BUFFER_MAX` bytes, the oldest going first. Never blocks on I/O.
+        """
+        with self._audio_cv:
+            if not self._talking:
+                return len(alaw)
+            self._pending += alaw
+            excess = len(self._pending) - TALK_BUFFER_MAX
+            if excess > 0:
+                del self._pending[:excess]
+                self.bytes_dropped += excess
+            self._audio_cv.notify_all()
+            return max(excess, 0)
+
+    def _send_loop(self) -> None:
+        """Send the queued audio as one 320-byte frame every 40 ms.
+
+        While nothing else goes out (muted, or no microphone audio), it sends the
+        protocol's keepalive (``0x00``) every :data:`KEEPALIVE_INTERVAL`, as the
+        video connection does, so a muted channel is not left silent.
+        """
+        due = 0.0
+        while not self._stop.is_set():
+            chunk: bytes | None = None
+            with self._audio_cv:
+                while not self._stop.is_set():
+                    if self._talking and len(self._pending) >= TALK_FRAME_BYTES:
+                        chunk = bytes(self._pending[:TALK_FRAME_BYTES])
+                        del self._pending[:TALK_FRAME_BYTES]
+                        break
+                    idle = time.monotonic() - self._last_sent
+                    if idle >= KEEPALIVE_INTERVAL:
+                        break
+                    self._audio_cv.wait(min(0.2, KEEPALIVE_INTERVAL - idle))
+                if self._stop.is_set():
+                    return
+            if chunk is None:
+                try:
+                    self._send_frame(
+                        lambda ts: ctrl_frame(FTYPE_KEEPALIVE, ts, b"", self._key)
+                    )
+                except (OSError, TransportError) as err:
+                    _LOGGER.debug("Keepalive to %s not sent: %s", self._duid, err)
+                    self._mark_peer_closed()
+                    return
+                continue
+            now = time.monotonic()
+            if due < now - TALK_SCHEDULE_SLACK:
+                due = now
+            elif due > now and self._stop.wait(due - now):
+                return
+            if not self._talking:
+                continue  # switched off while waiting for the slot
+            try:
+                self._send_frame(lambda ts, data=chunk: talk_frame(ts, data, self._key))
+            except (OSError, TransportError) as err:
+                _LOGGER.debug("Talk audio to %s not sent: %s", self._duid, err)
+                self._mark_peer_closed()
+                return
+            self.frames_sent += 1
+            due += TALK_FRAME_SECONDS
+
+    # --- Receiving -------------------------------------------------------------
+
+    def _answer_count(self) -> int:
+        with self._answer_cv:
+            return len(self._answers)
+
+    def _wait_answer(self, ftype: int, start: int, deadline: float) -> bool:
+        """Wait for an answer of type ``ftype`` that arrived after index ``start``."""
+        with self._answer_cv:
+            while True:
+                if any(a[0] == ftype for a in self._answers[start:]):
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or self._peer_closed or self._stop.is_set():
+                    return False
+                self._answer_cv.wait(timeout=min(remaining, 0.2))
+
+    def _rx_loop(self) -> None:
+        while not self._stop.is_set():
+            sock = self._sock
+            if sock is None:
+                return
+            try:
+                chunk = sock.recv(65536)
+            except TimeoutError:
+                continue
+            except OSError:
+                chunk = b""
+            if not chunk:
+                self._mark_peer_closed()
+                return
+            _quick_ack(sock)
+            self._buf += chunk
+            self._process_buffer()
+
+    def _process_buffer(self) -> None:
+        buf = self._buf
+        while len(buf) >= HEAD_LEN:
+            head = parse_audio_channel_head(
+                cbc_decrypt(bytes(buf[:HEAD_LEN]), self._key)
+            )
+            if head is None:
+                _LOGGER.debug(
+                    "Unreadable frame on the audio channel of %s -- closing it",
+                    self._duid,
+                )
+                self._mark_peer_closed()
+                return
+            total = HEAD_LEN + head.body_len
+            if len(buf) < total:
+                return
+            del buf[:total]
+            if head.ftype == FTYPE_CLOSE:
+                _LOGGER.debug("The station closed the audio channel of %s", self._duid)
+                self._mark_peer_closed()
+                return
+            if head.ftype == FTYPE_KEEPALIVE:
+                continue
+            _LOGGER.debug(
+                "Audio channel of %s: answer type 0x%02x msg13=%d content=%04x",
+                self._duid,
+                head.ftype,
+                head.msg13,
+                head.content_len,
+            )
+            with self._answer_cv:
+                self._answers.append((head.ftype, head.msg13, head.content_len))
+                self._answer_cv.notify_all()
+
+    def _mark_peer_closed(self) -> None:
+        self._peer_closed = True
+        with self._answer_cv:
+            self._answer_cv.notify_all()
+        with self._audio_cv:
+            self._talking = False
+            self._pending.clear()
+            self._audio_cv.notify_all()
+        callback = self._on_closed
+        if callback is not None and not self._closed and not self._closed_reported:
+            self._closed_reported = True
+            try:
+                callback()
+            except Exception:  # noqa: BLE001 -- never kill a channel thread
+                _LOGGER.exception("Close callback of the audio channel raised")
+
+    # --- Sending / teardown ----------------------------------------------------
+
+    def _raw_send(self, data: bytes) -> None:
+        with self._send_lock:
+            self._sendall(data)
+
+    def _send_frame(self, build: Callable[[int], bytes]) -> None:
+        """Send ``build(ts)`` with the next frame counter.
+
+        Counter and write happen under one lock: the sender thread and the
+        executor threads (talk state, close) never send out of counter order.
+        """
+        with self._send_lock:
+            self._ts = (self._ts + 1) & 0xFFFFFFFF
+            self._sendall(build(self._ts))
+
+    def _sendall(self, data: bytes) -> None:
+        """Write ``data`` (send lock held)."""
+        sock = self._sock
+        if sock is None:
+            raise SessionClosedError("the audio channel is closed")
+        sock.sendall(data)
+        self._last_sent = time.monotonic()
+
+    def close(self) -> None:
+        """Stop talking, say goodbye (``0x07``) and close the connection."""
+        if self._closed:
+            return
+        self._closed = True
+        was_talking = self._talking
+        with self._audio_cv:
+            self._talking = False
+            self._pending.clear()
+            self._audio_cv.notify_all()
+        self._stop.set()
+        if self._sock is not None and not self._peer_closed:
+            try:
+                if was_talking:
+                    self._send_frame(lambda ts: talk_state_frame(ts, False, self._key))
+                self._send_frame(lambda ts: ctrl_frame(FTYPE_CLOSE, ts, b"", self._key))
+            except (OSError, TransportError):
+                pass
+        sock = self._sock
+        self._sock = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+        with self._answer_cv:
+            self._answer_cv.notify_all()
+        for thread in self._threads:
+            if thread is not threading.current_thread():
+                thread.join(timeout=1.0)
+        _LOGGER.debug("Audio channel to %s closed", self._duid)
