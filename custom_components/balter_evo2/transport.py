@@ -94,7 +94,16 @@ class SessionClosedError(TransportError):
 
 
 class DoorRejectedError(TransportError):
-    """The station answered the door command with a refusal (wrong door PIN)."""
+    """The station answered the door command with a refusal.
+
+    ``answer`` is the station's two-byte answer: ``01 00`` for a wrong door PIN,
+    ``01 01`` for a lock it does not open (seen for the second lock of an EVO 2).
+    """
+
+    def __init__(self, message: str, answer: bytes = b"") -> None:
+        """Keep the station's answer for the caller's message."""
+        super().__init__(message)
+        self.answer = answer
 
 
 class StationBusyError(TransportError):
@@ -134,6 +143,7 @@ MSG_PROFILE = 18  # JSON description of the station's channels and locks
 # First payload byte of the station's OPENDOOR answer when it opened the door
 # (``00 01``); a refusal is ``01 00``.
 DOOR_OPENED = b"\x00"
+DOOR_WRONG_PIN = b"\x01\x00"
 
 
 def _quick_ack(sock: socket.socket) -> None:
@@ -220,6 +230,7 @@ class TcpStationTransport:
         # Public readiness signals.
         self.logged_in = threading.Event()  # first valid down frame parsed
         self.device_ready = threading.Event()  # app session free (0xFE msg13=2)
+        self.session_ready = threading.Event()  # station answered our setup frames
         self.media_started = threading.Event()  # first media packet arrived
         self.station_silent = False  # station never answered the handshake
 
@@ -502,8 +513,8 @@ class TcpStationTransport:
         answer = self._door_answer or b""
         if answer[:1] != DOOR_OPENED:
             raise DoorRejectedError(
-                f"{self._duid} refused the door command (answer {answer.hex()}) -- "
-                "wrong door PIN?"
+                f"{self._duid} refused the door command (answer {answer.hex()})",
+                answer,
             )
         _LOGGER.debug("Door unlock confirmed by %s (0xFE msg13=4)", self._duid)
         return True
@@ -632,6 +643,16 @@ class TcpStationTransport:
             _LOGGER.debug(
                 "Station %s signalled session ready (0xFE msg13=2)", self._duid
             )
+        _LOGGER.debug(
+            "Station %s: frame type 0x%02x msg13=%d, %d bytes, starts %s",
+            self._duid,
+            ftype,
+            msg13,
+            len(payload),
+            payload[:8].hex() or "-",
+        )
+        if ftype == FTYPE_CONTROL and msg13 == MSG_SESSION_READY:
+            self.session_ready.set()
         if ftype == FTYPE_CONTROL and msg13 == MSG_OPENDOOR:
             self._door_answer = payload
             _LOGGER.debug(

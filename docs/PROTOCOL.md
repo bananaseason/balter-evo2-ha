@@ -77,11 +77,33 @@ Note the 16-bit length: the profile the station sends right after the login is a
 | --- | --- | --- |
 | 2 | both | session setup / session ready |
 | 4 | client | **open door**: payload 16 bytes (`door`, 0, `lock number`, 1, zeros) + 64 ASCII hex characters, the SHA-256 of the door PIN |
-| 4 | station | open-door answer: `00 01` opened, `01 00` refused (wrong PIN) |
+| 4 | station | open-door answer, two bytes, see below |
 | 5, 6 | client | setup frames the app sends after its LOGIN |
 | 8 | station | heartbeat with a counter, about once a second |
 | 14 | station | sent first in a session that will carry video |
 | 18 | station | JSON profile: channels, locks and their names |
+
+The station answers the client's setup frames: `msg13=5` with `00 05` at once, and
+`msg13=2` with the profile (`msg13=18`) followed by "session ready" (`msg13=2`, `01 01`).
+An open-door command that is sent before that answer can be dropped without any reply
+(seen with the command sent 230 ms before the answers arrived). The phone app sends the
+command only while its picture runs.
+
+Answers to the open-door command, as seen on an EVO 2 (`IDS94A6FW`):
+
+| Answer | When |
+| --- | --- |
+| `00 01` | lock 1, right PIN: accepted, 60 ms after the command |
+| `01 00` | lock 1, wrong PIN |
+| `01 01` | lock 2, right PIN: refused, although the station lists the lock as enabled |
+| `00 00` | a real opening by the phone app on another unit, 1.9 s after the command (from the notes of balter-evo-ha) |
+
+The first byte is taken as the result (0 = accepted). What the second byte says is not
+known, and neither is whether `00 01` and `00 00` mean the same thing.
+
+Locks are named by the cloud's sub-device list and by the station's profile with codes
+such as `Channel_1 lock1`, `Channel_1 lock2` (EVO 2), `lock_chn1 1` or `door1-lock1`:
+door station and lock number, both 1-based, the values the open-door payload carries.
 
 ### Media frames (type `0xA0`)
 

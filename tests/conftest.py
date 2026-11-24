@@ -318,6 +318,7 @@ class FakeStation:
         echo: bytes | None = None,
         send_echo: bool = True,
         send_ready: bool = True,
+        ready_after_setup: float | None = None,
         send_profile: bool = True,
         media: list[bytes] | None = None,
         stream: bool = False,
@@ -336,6 +337,10 @@ class FakeStation:
         self.echo = echo if echo is not None else load_fixture("a9_echo.bin")
         self.send_echo = send_echo
         self.send_ready = send_ready
+        # Like the real station: "session ready" is the answer to the client's
+        # msg13=2 setup frame and comes this many seconds after it.
+        self.ready_after_setup = ready_after_setup
+        self.events: list[str] = []
         self.send_profile = send_profile
         self.media = media or []
         self.stream = stream
@@ -476,7 +481,7 @@ class FakeStation:
                 return
         if self.send_profile:
             self._send(conn, profile_frame(self.key))
-        if self.send_ready:
+        if self.send_ready and self.ready_after_setup is None:
             self._send(conn, control_frame(self.key, READY_MSG13, b"\x00\x01"))
         video = index > self.no_video_connections
         if video:
@@ -521,6 +526,16 @@ class FakeStation:
             del buf[:total]
             with self._lock:
                 self.frames.append((ftype, msg13, payload, raw))
+            if (
+                ftype == 0xFE
+                and msg13 == READY_MSG13
+                and self.ready_after_setup is not None
+            ):
+                time.sleep(self.ready_after_setup)
+                self._send(conn, control_frame(self.key, READY_MSG13, b"\x01\x01"))
+                self.events.append("ready sent")
+            if ftype == 0xFE and msg13 == OPEN_MSG13:
+                self.events.append("open received")
             if ftype == 0xFE and msg13 == OPEN_MSG13 and self.ack_open:
                 if self.ack_delay:
                     time.sleep(self.ack_delay)

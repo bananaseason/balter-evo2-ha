@@ -35,6 +35,7 @@ from .const import CONF_DOOR_PIN, DOMAIN, MANUFACTURER, RELOCK_DELAY
 from .coordinator import BalterEvo2Coordinator
 from .models import Device, DoorLock
 from .station import (
+    DOOR_WRONG_PIN,
     DoorRejectedError,
     StationBusyError,
     StationManager,
@@ -157,10 +158,16 @@ class BalterEvo2DoorLock(CoordinatorEntity[BalterEvo2Coordinator], LockEntity):
                 )
         except DoorRejectedError as err:
             _LOGGER.warning("Door unlock refused by %s: %s", self._duid, err)
+            if err.answer[:2] == DOOR_WRONG_PIN:
+                raise HomeAssistantError(
+                    "The door station refused the command: the door PIN is wrong. "
+                    "Correct it in the integration options, or leave it empty to "
+                    "use the code registered for the station."
+                ) from err
             raise HomeAssistantError(
-                "The door station refused the command: the door PIN is wrong. "
-                "Correct it in the integration options, or leave it empty to use "
-                "the code registered for the station."
+                f"The door station refused to open this lock (answer "
+                f"{err.answer.hex() or 'none'}). The door PIN was accepted; the "
+                "station does not open this lock for the app."
             ) from err
         except StationSilentError as err:
             # The station never answered, so it accepted no session: the next

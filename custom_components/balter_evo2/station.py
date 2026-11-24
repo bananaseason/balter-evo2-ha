@@ -59,6 +59,7 @@ from .const import (
 from .models import Credentials, Device
 from .protocol import MediaPacket
 from .transport import (
+    DOOR_WRONG_PIN,
     DoorRejectedError,
     StationBusyError,
     StationSilentError,
@@ -69,6 +70,7 @@ from .transport import (
 _LOGGER = logging.getLogger(__name__)
 
 __all__ = [
+    "DOOR_WRONG_PIN",
     "StationManager",
     "DoorRejectedError",
     "StationBusyError",
@@ -78,6 +80,8 @@ __all__ = [
 
 # How long the whole door-unlock session may take (handshake + readiness + ack).
 DOOR_SESSION_TIMEOUT = 20.0
+# How long the station gets to answer the setup frames before a door command.
+SETUP_ANSWER_TIMEOUT = 2.0
 
 # Snapshot recording window: an upper bound. A still ends it as soon as the
 # first keyframe has arrived (about half a second after the login).
@@ -110,7 +114,8 @@ class UnlockResult:
     ready: bool = False  # station freed its app session
     sent: bool = False  # OPENDOOR left the client
     acked: bool = False  # station acknowledged (0xFE msg13=4)
-    rejected: bool = False  # station refused the command (wrong door PIN)
+    rejected: bool = False  # station refused the command
+    answer: bytes = b""  # the station's answer to a refused command
     silent: bool = False  # station never answered the handshake
 
     def __bool__(self) -> bool:
@@ -310,7 +315,8 @@ class StationManager:
             return True
         if result.rejected:
             raise DoorRejectedError(
-                "The door station refused the command -- the door PIN is wrong."
+                f"The door station refused the command (answer {result.answer.hex()}).",
+                result.answer,
             )
         if result.sent:
             return False
@@ -769,8 +775,9 @@ class StationManager:
                     result.acked = live.send_open(door, locknumber, pin_hash)
                 except StationBusyError:
                     pass  # provably not sent: take the normal path below
-                except DoorRejectedError:
+                except DoorRejectedError as err:
                     result.ready = result.sent = result.rejected = True
+                    result.answer = err.answer
                     return result
                 except TransportError:
                     result.ready = result.sent = True
@@ -814,7 +821,20 @@ class StationManager:
                             transport.handshake_states(),
                         )
                         return result
-                    if not transport.wait(
+                    # The setup frames go out right after the LOGIN, as in a
+                    # live view, and the command waits for the station's answer
+                    # to them. Sent before that answer (the station needs about
+                    # half a second to bring the channel up) a command can be
+                    # dropped without any answer. A station that streams but
+                    # never answers the setup is taken as ready all the same.
+                    transport.send_session_setup()
+                    answered = transport.wait(
+                        transport.session_ready,
+                        min(
+                            SETUP_ANSWER_TIMEOUT, max(deadline - time.monotonic(), 0.0)
+                        ),
+                    )
+                    if not answered and not transport.wait(
                         transport.device_ready, max(deadline - time.monotonic(), 0.0)
                     ):
                         self._record_handshake(transport)
@@ -826,7 +846,15 @@ class StationManager:
                             transport.handshake_states(),
                         )
                         return result
-                    transport.send_session_setup()
+                    # The phone app only ever sends the command while its picture
+                    # runs, that is once the station has the door station's
+                    # channel open. Do the same; a session without video (somebody
+                    # else is watching) still gets the command after the wait.
+                    if not transport.wait(transport.media_started, MEDIA_START_TIMEOUT):
+                        _LOGGER.debug(
+                            "No video from %s before the door command -- sending anyway",
+                            device.duid,
+                        )
 
                 self._record_handshake(transport)
                 result.ready = True
@@ -835,8 +863,9 @@ class StationManager:
                 except StationBusyError:
                     # device_ready was lost between the check and the send.
                     return result
-                except DoorRejectedError:
+                except DoorRejectedError as err:
                     result.sent = result.rejected = True
+                    result.answer = err.answer
                     return result
                 except TransportError:
                     # Socket died while sending: treat as sent-but-unacked so the

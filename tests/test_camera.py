@@ -750,6 +750,44 @@ async def test_mjpeg_view_starts_a_live_view_and_the_response_ends_with_it(
     assert await until(lambda: state_of(hass) == "idle")
 
 
+async def test_a_viewer_that_stops_reading_is_dropped_and_the_view_ends(
+    hass: HomeAssistant,
+    setup_camera: Any,
+    manager: FakeManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A phone app in the background or a sleeping tablet keeps its connection
+    # open and simply stops reading: every write to it blocks. It must not hold
+    # the live view (and with it the station) for the whole live-view length.
+    monkeypatch.setattr(camera_mod, "UNWATCHED_GRACE", 0.1)
+    monkeypatch.setattr(camera_mod, "VIEWER_STALL_TIMEOUT", 0.2)
+    manager.endless = True
+    await setup_camera()
+
+    class FrozenViewer:
+        """A response whose third write never finishes."""
+
+        content_type = ""
+        writes = 0
+
+        async def prepare(self, request: Any) -> None:
+            return None
+
+        async def write(self, data: bytes) -> None:
+            FrozenViewer.writes += 1
+            if FrozenViewer.writes >= 3:
+                await asyncio.Event().wait()
+
+    monkeypatch.setattr(camera_mod.web, "StreamResponse", FrozenViewer)
+    request = MagicMock()
+    started = time.monotonic()
+    await asyncio.wait_for(entity(hass).handle_async_mjpeg_stream(request), 5)
+    assert time.monotonic() - started < 2
+    request.transport.abort.assert_called_once()  # the dead connection is cut
+    assert await until(lambda: state_of(hass) == "idle", 5)
+    assert manager.stopped_by_caller == 1
+
+
 async def test_viewer_started_view_ends_shortly_after_the_last_viewer_leaves(
     hass: HomeAssistant,
     setup_camera: Any,

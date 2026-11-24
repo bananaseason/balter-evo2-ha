@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.1.2 (2026-11-24)
+
+### Fixed
+
+- **An EVO 2 got only one of its two door openers, and that one was a guess.** The cloud
+  names the locks of this model `Channel_1 lock1` and `Channel_1 lock2`; neither was
+  understood, so both were dropped without a word and a default "door 1, lock 1" opener was
+  created instead. Both locks now get an entity (*Door opener* and *Door opener 2*; a name
+  you gave a lock in the phone app is kept). A lock code that is not understood is reported
+  in the log instead of being skipped silently.
+- **A live view kept running to its full length when the viewer left without closing the
+  connection**: a phone app sent to the background, a tablet that fell asleep, a device
+  that left the Wi-Fi. Such a viewer keeps the connection open and simply stops reading.
+  A viewer that takes no frame for two seconds is now dropped, and the live view ends as
+  it does when a viewer closes the picture (measured: the station is free about five
+  seconds after the viewer stopped reading).
+- **A door command sent to an idle station could be lost without any answer.** It was sent
+  as soon as video arrived, together with the setup frames and before the station had
+  answered them. The setup frames now go out right after the login and the command waits
+  for the station's answer to them and for the picture, which is the order the phone app
+  keeps.
+- A lock the station refuses to open was reported as "the door PIN is wrong". The two
+  answers are now told apart: `01 00` is a wrong PIN, anything else is reported as a
+  refusal together with the answer.
+
+### Changed
+
+- The debug log shows every control frame the station sends (type, message id, length,
+  first bytes).
+- The code is formatted with `ruff format`.
+
+### Upgrading
+
+Update and restart Home Assistant. A station with a second lock gets a new entity
+*Door opener 2*; like every lock it should not be exposed to voice assistants (see the
+README). Existing entities keep their ids.
+
 ## 1.1.1 (2026-11-24)
 
 ### Fixed

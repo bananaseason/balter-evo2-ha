@@ -62,6 +62,9 @@ DEFAULT_LOCK = {
     "locknumber": 1,
 }
 
+# Where unknown station variants are to be reported.
+ISSUE_URL = "https://github.com/bananaseason/balter-evo2-ha/issues"
+
 # --- Camera --------------------------------------------------------------------
 
 # Entity service of the camera: record a short MP4 clip and write it to disk.

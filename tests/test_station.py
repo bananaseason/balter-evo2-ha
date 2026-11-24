@@ -678,6 +678,48 @@ async def test_open_door_refused_raises_door_rejected(
     assert station.connections == 1
 
 
+async def test_a_refusal_carries_the_stations_answer(
+    manager: Any,
+    device: Device,
+    creds: Credentials,
+    make_station: Callable[..., FakeStation],
+) -> None:
+    # 01 01: the PIN was right, but the station does not open this lock.
+    make_station(open_answer=b"\x01\x01")
+    with pytest.raises(DoorRejectedError) as raised:
+        await manager.async_open_door(device, creds, 1, 2, TEST_PIN_SHA256)
+    assert raised.value.answer == b"\x01\x01"
+
+
+async def test_door_command_waits_for_the_answer_to_the_setup_frames(
+    manager: Any,
+    device: Device,
+    creds: Credentials,
+    make_station: Callable[..., FakeStation],
+) -> None:
+    # The real station answers "session ready" only to the client's own setup
+    # frames, about half a second later; a command sent before that answer can
+    # be dropped without any reply.
+    station = make_station(ready_after_setup=0.3)
+    assert await manager.async_open_door(device, creds, 1, 1, TEST_PIN_SHA256) is True
+    control = [msg13 for ftype, msg13, _p, _r in station.received(0xFE)]
+    assert control == [5, 6, 2, 4]
+    assert station.events == ["ready sent", "open received"]
+
+
+async def test_door_command_goes_out_to_a_station_that_streams_but_never_says_ready(
+    manager: Any,
+    device: Device,
+    creds: Credentials,
+    make_station: Callable[..., FakeStation],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(station_mod, "SETUP_ANSWER_TIMEOUT", 0.2)
+    station = make_station(send_ready=False, stream=True)
+    assert await manager.async_open_door(device, creds, 1, 1, TEST_PIN_SHA256) is True
+    assert len(station.opens()) == 1
+
+
 async def test_open_door_refused_over_a_live_view_raises_and_the_view_goes_on(
     manager: Any,
     device: Device,

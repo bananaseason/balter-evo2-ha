@@ -12,10 +12,11 @@ sold under brands such as **Balter EVO** and **Homaxi**.
 
 - **Camera** with a stored still image and an on-demand live view (768×432, about 18 frames
   a second) that always ends by itself
-- **Lock** entity for each door-release relay (momentary: unlocks, then shows locked again
-  after a few seconds). The station's answer is read: "unlocked" means it really opened,
-  and a wrong door PIN is reported as such. Opening the door during a live view does not
-  interrupt the picture
+- **Lock** entity for each door opener the station has (an EVO 2 has two; momentary:
+  unlocks, then shows locked again after a few seconds). The station's answer is read:
+  "unlocked" means the station accepted the command, a wrong door PIN and a lock the
+  station refuses to open are reported as such. Opening the door during a live view does
+  not interrupt the picture
 - Services for automations: `balter_evo2.start_live_view`, `stop_live_view`,
   `refresh_snapshot` and `record_clip` (1 to 30 seconds as MP4)
 - Local push: video and door control go straight to the station over TCP port 34567
@@ -65,7 +66,9 @@ The camera state is `streaming` while a live view runs and `idle` otherwise; the
 Keep in mind that every open MJPEG feed counts as a viewer. A card with `camera_view: live`
 that is always on screen (a wall tablet, for instance) starts a live view whenever it loads
 and keeps one alive for its full length; use the still (`camera_view: auto`) there and show
-the live card only on demand, as below.
+the live card only on demand, as below. A viewer counts only while it takes the frames: a
+phone app in the background or a sleeping tablet that keeps its connection open without
+reading is dropped after two seconds.
 
 ### Dashboard example
 

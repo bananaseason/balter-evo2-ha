@@ -21,17 +21,15 @@ import asyncio
 import contextlib
 import logging
 import os
+import socket
 import threading
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 import voluptuous as vol
-from homeassistant.components.camera import (
-    Camera,
-    CameraEntityFeature,
-    async_get_still_stream,
-)
+from aiohttp import web
+from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.core import HomeAssistant, SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
@@ -83,8 +81,47 @@ UNWATCHED_GRACE = 1.0
 # viewers are woken by the frames themselves.
 FRAME_WAIT = 1.0
 
-# Content type of the MJPEG response.
-MJPEG_CONTENT_TYPE = "image/jpeg"
+# A viewer that has not taken a frame for this long is gone, whatever its
+# connection says: a phone app that went to the background, a tablet that fell
+# asleep or a client that left the Wi-Fi keeps the connection open without
+# reading from it. Left alone it would hold the live view, and with it the
+# station, for the whole live view length.
+VIEWER_STALL_TIMEOUT = 2.0
+
+# Send buffer of a viewer's connection. The operating system would otherwise
+# queue seconds of video for a viewer that stopped reading before a write
+# blocks, and the stall above would be noticed that much later.
+VIEWER_SEND_BUFFER = 32 * 1024
+
+# The response is laid out exactly like Home Assistant's own MJPEG helper
+# (async_get_still_stream), which every frontend and app is known to show.
+MJPEG_BOUNDARY = "--frameboundary"
+MJPEG_CONTENT_TYPE = f"multipart/x-mixed-replace;boundary={MJPEG_BOUNDARY}"
+
+
+def _mjpeg_part(jpeg: bytes) -> bytes:
+    """Wrap one JPEG as a part of the multipart response."""
+    return (
+        (
+            f"{MJPEG_BOUNDARY}\r\nContent-Type: image/jpeg\r\n"
+            f"Content-Length: {len(jpeg)}\r\n\r\n"
+        ).encode("ascii")
+        + jpeg
+        + b"\r\n"
+    )
+
+
+def _bound_send_buffer(request: web.BaseRequest) -> None:
+    """Keep little unsent video queued for one viewer (see VIEWER_SEND_BUFFER)."""
+    transport = request.transport
+    if transport is None:
+        return
+    sock = transport.get_extra_info("socket")
+    if sock is not None:
+        with contextlib.suppress(OSError):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, VIEWER_SEND_BUFFER)
+    with contextlib.suppress(AttributeError, NotImplementedError, ValueError):
+        transport.set_write_buffer_limits(high=VIEWER_SEND_BUFFER)
 
 
 def still_path(hass: HomeAssistant, entry_id: str, duid: str) -> str:
@@ -386,7 +423,9 @@ class BalterEvo2Camera(CoordinatorEntity[BalterEvo2Coordinator], Camera):
         """Serve the MJPEG feed; opening it starts a live view.
 
         The response ends when the live view does, so the browser is left with
-        the last frame instead of a connection that never finishes.
+        the last frame instead of a connection that never finishes. A viewer
+        counts only while it takes the frames: one that stops reading is dropped
+        (see VIEWER_STALL_TIMEOUT) and no longer keeps the live view alive.
         """
         await self._async_wait_if_stopping()
         if not self._streaming:
@@ -395,15 +434,45 @@ class BalterEvo2Camera(CoordinatorEntity[BalterEvo2Coordinator], Camera):
         self._viewers += 1
         self._cancel_unwatched_stop()
         try:
-            return await async_get_still_stream(
-                request, self._frame_source(), MJPEG_CONTENT_TYPE, 0
-            )
+            return await self._async_serve_mjpeg(request)
         finally:
             self._viewers -= 1
             if self._viewers <= 0 and self._streaming and self._viewer_owned:
                 self._unwatched_handle = self.hass.loop.call_later(
                     UNWATCHED_GRACE, self._stop_if_unwatched
                 )
+
+    async def _async_serve_mjpeg(self, request: web.BaseRequest) -> web.StreamResponse:
+        """Write the live frames to one viewer until the view ends or it stalls."""
+        response = web.StreamResponse()
+        response.content_type = MJPEG_CONTENT_TYPE
+        await response.prepare(request)
+        _bound_send_buffer(request)
+        next_frame = self._frame_source()
+        first = True
+        while (frame := await next_frame()) is not None:
+            part = _mjpeg_part(frame)
+            try:
+                async with asyncio.timeout(VIEWER_STALL_TIMEOUT):
+                    await response.write(part)
+                    if first:
+                        # Chrome shows a frame only when the next one arrives
+                        # (https://issues.chromium.org/issues/41199053), so the
+                        # first one is sent twice.
+                        await response.write(part)
+            except TimeoutError:
+                _LOGGER.debug(
+                    "A viewer of %s took no frame for %.0f s -- dropped",
+                    self._duid,
+                    VIEWER_STALL_TIMEOUT,
+                )
+                # The connection is full of video nobody reads; it cannot be
+                # finished in an orderly way, so it is cut.
+                if request.transport is not None:
+                    request.transport.abort()
+                break
+            first = False
+        return response
 
     def _frame_source(self) -> Callable[[], Awaitable[bytes | None]]:
         """Return a per-viewer callback that yields each live frame once.

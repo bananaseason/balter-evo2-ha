@@ -41,6 +41,7 @@ from .const import (
     DISCOVERY_PATH,
     HOST,
     IP_REGION_ID,
+    ISSUE_URL,
     OEM_ID,
     REQUEST_TIMEOUT,
     USER_AGENT,
@@ -73,13 +74,34 @@ def _empty_credentials() -> dict[str, str]:
     return {"dynamic_password": "", "data_encode_key": "", "out_auth_code": ""}
 
 
-# Depending on the firmware the cloud writes lock codes as "lock_chn1 1" (EVO 2,
-# observed live) or "door1-lock1". Both mean channel (= door station) and lock
-# number, both 1-based -- exactly the indices the OPENDOOR frame carries.
+# The cloud writes lock codes as "Channel_1 lock2" (EVO 2 IDS94A6FW, observed
+# live), "lock_chn1 1" or "door1-lock1", depending on the firmware. All of them
+# mean channel (= door station) and lock number, both 1-based -- exactly the
+# indices the OPENDOOR frame carries.
 _LOCK_CODE_RES = (
+    re.compile(
+        r"^channel[ _-]*(?P<door>\d+)[ _-]+lock[ _-]*(?P<lock>\d+)$", re.IGNORECASE
+    ),
     re.compile(r"^lock_chn(?P<door>\d+)[ _-]+(?P<lock>\d+)$", re.IGNORECASE),
     re.compile(r"^door(?P<door>\d+)-lock(?P<lock>\d+)$", re.IGNORECASE),
 )
+
+# A lock the owner never renamed is called "<door station> lock<n>" by the cloud.
+_DEFAULT_LOCK_NAME_RE = re.compile(r"lock[ _-]*\d+$", re.IGNORECASE)
+
+
+def _lock_name(name: str, door: int, locknumber: int, doors: int) -> str:
+    """Return the entity name of one lock.
+
+    A name the owner gave the lock in the phone app is kept. The factory names
+    ("Türstation 1 lock2") are replaced by a plain one that says which opener of
+    which door station it is.
+    """
+    name = (name or "").strip()
+    if name and not _DEFAULT_LOCK_NAME_RE.search(name):
+        return name
+    number = "" if locknumber == 1 else f" {locknumber}"
+    return f"Door opener{number}" if doors <= 1 else f"Door {door} opener{number}"
 
 
 def _parse_lock_code(code: str) -> tuple[int, int] | None:
@@ -554,11 +576,24 @@ class BalterEvo2CloudClient:
                 for sub in sub_devlist
                 if sub.get("type") == "chn" and sub.get("enable")
             }
+            doors = sum(1 for sub in sub_devlist if sub.get("type") == "chn")
             for sub in sub_devlist:
                 if sub.get("type") != "lock":
                     continue
-                parsed = _parse_lock_code(sub.get("code", ""))
+                if "enable" in sub and not sub.get("enable"):
+                    continue
+                code = sub.get("code", "")
+                parsed = _parse_lock_code(code)
                 if parsed is None:
+                    # Never guess silently: a lock that is skipped here has no
+                    # entity, and the default opener may be the wrong relay.
+                    _LOGGER.warning(
+                        "The lock code %r of %s is not understood; this lock gets "
+                        "no entity. Please report it: %s",
+                        code,
+                        duid,
+                        ISSUE_URL,
+                    )
                     continue
                 door, locknumber = parsed
                 if enabled_doors and door not in enabled_doors:
@@ -568,11 +603,14 @@ class BalterEvo2CloudClient:
                         # Canonical code: the entities' unique_id depends on it,
                         # so normalise independently of the device's spelling.
                         "code": f"door{door}-lock{locknumber}",
-                        "name": sub.get("name") or f"door{door}-lock{locknumber}",
+                        "name": _lock_name(
+                            sub.get("name", ""), door, locknumber, doors
+                        ),
                         "door": door,
                         "locknumber": locknumber,
                     }
                 )
+        locks.sort(key=lambda lock: (lock["door"], lock["locknumber"]))
         return locks
 
     # --------------------------------------------------------------- helpers
