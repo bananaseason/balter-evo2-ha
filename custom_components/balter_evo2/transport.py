@@ -21,13 +21,13 @@ What travels on the wire (verified byte-exact against ``balter_tcp.pcap``):
   play/start command;
 * both sides send a 64-byte keepalive control frame every ~10 s.
 
-The receive stream is a back-to-back concatenation of inner application frames.
-Each frame is *self-describing through its AES-encrypted head*: the only way to
-find a frame boundary is to decrypt the 32/64-byte head with the device's
-``data_encode_key``. Control frames are ``32 + head[9]`` bytes; media frames are
-a 64-byte AES head plus plaintext H.264 whose length is **not** in ``head[9]``
-and is resolved by :class:`MediaLengthResolver` (see its docstring for the one
-remaining live-validation blocker).
+The receive stream is a back-to-back concatenation of application frames. Each
+frame is *self-describing through its AES-encrypted 32-byte head*
+(:func:`protocol.parse_head`): a control frame is ``32 + encrypted_len`` bytes,
+a media frame ``32 + content_len`` bytes of which only the first
+``encrypted_len`` are encrypted. Media payloads are parsed into
+:class:`protocol.MediaPacket` (video frame, keyframe or audio chunk) before they
+reach the sink, so no consumer ever has to guess a boundary.
 
 TCP owns ordering, retransmission and reassembly, so there is deliberately no
 seq/ack/ARQ/checksum logic here. Every call blocks and must run in an executor
@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import logging
 import socket
-import struct
 import threading
 import time
 from collections import deque
@@ -54,12 +53,21 @@ from collections.abc import Callable
 
 from .const import KEEPALIVE_INTERVAL, LOGIN_TIMEOUT, OEM_ID_COMPACT
 from .protocol import (
-    MEDIA_HEAD_LEN,
+    FTYPE_CLOSE,
+    FTYPE_CONTROL,
+    FTYPE_KEEPALIVE,
+    FTYPE_LOGIN,
+    HEAD_LEN,
+    KNOWN_FTYPES,
+    MediaPacket,
     build_a9_body,
     build_login_payload,
     build_open_payload,
     cbc_decrypt,
+    control_payload,
     ctrl_frame,
+    parse_head,
+    parse_media,
     session_key,
 )
 
@@ -81,6 +89,14 @@ class StationSilentError(TransportError):
     """
 
 
+class SessionClosedError(TransportError):
+    """The session was already closed, so nothing was written to the station."""
+
+
+class DoorRejectedError(TransportError):
+    """The station answered the door command with a refusal (wrong door PIN)."""
+
+
 class StationBusyError(TransportError):
     """The station answered but never freed its single app session in time.
 
@@ -90,17 +106,6 @@ class StationBusyError(TransportError):
 
 
 # --- Protocol / timing constants --------------------------------------------
-
-# Control-frame geometry. ``head[9]`` is the padded length of the payload plus
-# its 32-byte SHA-256 trailer; a frame is ``32 + head[9]`` bytes. An empty
-# payload gives ``head[9] == 32`` -> the 64-byte keepalive. A plausible control
-# frame has ``head[9]`` a positive multiple of 16, bounded well below anything a
-# door station sends on its control channel.
-MAX_CTRL_FRAME = 4096
-
-# Media frames carry plaintext H.264 of unbounded length; this only guards the
-# fallback length resolver against runaway buffering on a desync.
-MAX_MEDIA_FRAME = 1 << 20  # 1 MiB
 
 # Receive-socket poll timeout: short enough to notice ``_stop`` promptly, long
 # enough not to spin.
@@ -117,156 +122,23 @@ OPENDOOR_ACK_TIMEOUT = 6.0
 # independent readiness signal besides the explicit ``0xFE msg13=2`` marker.
 STREAM_IS_PROOF = 4096
 
-# Control-head field offsets (decrypted), from ctrl_frame()'s layout.
-_HEAD_TYPE = 0
-_HEAD_PLEN = 9
-_HEAD_CLEN = 11
-_HEAD_MSG13 = 13
-
-# Media-head field offsets (decrypted 32/64-byte head), from P2P_PROTOCOL.md 5b.
-_MEDIA_TYPE = 0xA0
-_MEDIA_WIDTH_OFF = 0x30
-_MEDIA_HEIGHT_OFF = 0x32
-_MEDIA_MAX_DIM = 4096
-
 # a9 echo recognition: byte0 = 0xA9, byte10 = 0x02, byte11 = 0x01 (accepted).
 _A9_ECHO_MARKER = {0: 0xA9, 10: 0x02, 11: 0x01}
 
-# Control frame types ever seen on the station's down stream (keepalive, LOGIN
-# echo, close, the 0xFE control/ready/ack family). The fallback length scanner
-# only accepts a candidate control head whose type is one of these, instead of
-# any head whose plen happens to be a multiple of 16 -- the latter matches ~6 %
-# of random plaintext positions and mis-frames the H.264 body.
-_KNOWN_CTRL_FTYPES = frozenset({0x00, 0x01, 0x07, 0xFE})
+# Message ids of the ``0xFE`` control family seen on a live station.
+MSG_SESSION_READY = 2  # answer to the client's msg13=2 setup frame
+MSG_OPENDOOR = 4  # OPENDOOR and its acknowledgement
+MSG_HEARTBEAT = 8  # station tick, about once a second while streaming
+MSG_PROFILE = 18  # JSON description of the station's channels and locks
 
-# Media length resolver: the EXACT offset of the H.264 body length inside the
-# decrypted 64-byte media head is UNRESOLVED from the capture (candidate regions:
-# 6 bytes @0x0a-0x10, or a uint32 in the @0x20 block). Until it is pinned live,
-# leave this ``None`` and the resolver uses its next-head scan fallback. Once the
-# offset is known, set these three and the resolver reads it directly -- the only
-# change needed to swap the fallback for the exact field.
-MEDIA_LEN_OFFSET: int | None = None
-MEDIA_LEN_FORMAT = "<I"  # struct format of the length field, when pinned
-MEDIA_LEN_INCLUDES_HEAD = False  # does the field count the 64-byte head?
+# First payload byte of the station's OPENDOOR answer when it opened the door
+# (``00 01``); a refusal is ``01 00``.
+DOOR_OPENED = b"\x00"
 
 
-class MediaLengthResolver:
-    """Delimit one media (``0xA0``) frame on the TCP stream.
-
-    A media frame is a 64-byte AES head followed by plaintext H.264 whose length
-    is **not** carried in ``head[9]``. Two strategies:
-
-    * **primary** -- read a pinned length field from the decrypted 64-byte head
-      at :data:`MEDIA_LEN_OFFSET`. Unknown until a live decrypt pins it; wired up
-      and ready, simply off by default.
-    * **fallback** -- scan forward from offset 64 at 16-byte-aligned boundaries
-      for the next decodable frame head (a ``0xA0`` head with a sane width and
-      height, or a plausible control head), treating everything up to it as this
-      frame's H.264 body. Works without the pinned offset: the media is ~17 fps,
-      ~1 keyframe/s, 352x280, and only keyframe start codes are visible raw --
-      P-frame leading start codes are encrypted inside each head, which is why
-      per-frame head decryption is unavoidable.
-    """
-
-    def __init__(
-        self,
-        key: bytes,
-        offset: int | None = MEDIA_LEN_OFFSET,
-        fmt: str = MEDIA_LEN_FORMAT,
-        includes_head: bool = MEDIA_LEN_INCLUDES_HEAD,
-    ) -> None:
-        """Bind the resolver to the session key and the (optional) pinned offset."""
-        self._key = key
-        self._offset = offset
-        self._fmt = fmt
-        self._includes_head = includes_head
-        # Picture size (width, height) latched from the first validly decoded
-        # media head; subsequent media boundaries must match it exactly, which
-        # narrows the fallback scanner's false positives by orders of magnitude.
-        self._dims: tuple[int, int] | None = None
-
-    def resolve(self, buf: bytes, head64: bytes, *, flush: bool) -> int | None:
-        """Return the total frame length, or ``None`` if more data is needed.
-
-        ``buf`` is the receive buffer starting at this frame's head, ``head64``
-        its decrypted 64-byte head. ``flush`` (the socket has closed) forces a
-        best-effort boundary at the end of the buffer.
-        """
-        if self._offset is not None:
-            total = self._resolve_pinned(head64)
-            if total is not None:
-                return total
-            # A pinned field that reads back nonsense: fall through to the scan
-            # rather than emit a corrupt frame.
-        self._latch_dims(head64)
-        boundary = self._scan(buf)
-        if boundary is not None:
-            return boundary
-        if flush and len(buf) >= MEDIA_HEAD_LEN:
-            return len(buf)
-        if len(buf) - MEDIA_HEAD_LEN >= MAX_MEDIA_FRAME:
-            # No decodable boundary within the whole scan window: emit a
-            # best-effort boundary at the cap so a persistent desync cannot grow
-            # the receive buffer without bound (the next head realigns via
-            # _resync). The frame itself is dropped as undecodable downstream.
-            return MEDIA_HEAD_LEN + MAX_MEDIA_FRAME
-        return None
-
-    def _latch_dims(self, head64: bytes) -> None:
-        if self._dims is not None or len(head64) < _MEDIA_HEIGHT_OFF + 2:
-            return
-        width = struct.unpack_from("<H", head64, _MEDIA_WIDTH_OFF)[0]
-        height = struct.unpack_from("<H", head64, _MEDIA_HEIGHT_OFF)[0]
-        if 0 < width <= _MEDIA_MAX_DIM and 0 < height <= _MEDIA_MAX_DIM:
-            self._dims = (width, height)
-
-    def _resolve_pinned(self, head64: bytes) -> int | None:
-        size = struct.calcsize(self._fmt)
-        if self._offset is None or self._offset + size > len(head64):
-            return None
-        value = struct.unpack_from(self._fmt, head64, self._offset)[0]
-        total = value if self._includes_head else MEDIA_HEAD_LEN + value
-        if MEDIA_HEAD_LEN <= total <= MAX_MEDIA_FRAME:
-            return total
-        return None
-
-    def _scan(self, buf: bytes) -> int | None:
-        limit = min(len(buf) - MEDIA_HEAD_LEN, MAX_MEDIA_FRAME)
-        pos = MEDIA_HEAD_LEN
-        while pos <= limit:
-            if self._is_frame_head(buf, pos):
-                return pos
-            pos += 16
-        return None
-
-    def _is_frame_head(self, buf: bytes, pos: int) -> bool:
-        head = cbc_decrypt(bytes(buf[pos : pos + 32]), self._key)
-        if len(head) < 32:
-            return False
-        if head[_HEAD_TYPE] == _MEDIA_TYPE:
-            if pos + MEDIA_HEAD_LEN > len(buf):
-                return False
-            wide = cbc_decrypt(bytes(buf[pos : pos + MEDIA_HEAD_LEN]), self._key)
-            width = struct.unpack_from("<H", wide, _MEDIA_WIDTH_OFF)[0]
-            height = struct.unpack_from("<H", wide, _MEDIA_HEIGHT_OFF)[0]
-            if self._dims is not None:
-                # Once the stream's picture size is known, a real media head must
-                # carry exactly it; "merely sane" dimensions are a coincidence.
-                return (width, height) == self._dims
-            return 0 < width <= _MEDIA_MAX_DIM and 0 < height <= _MEDIA_MAX_DIM
-        plen = head[_HEAD_PLEN]
-        return (
-            head[_HEAD_TYPE] in _KNOWN_CTRL_FTYPES
-            and 32 <= plen <= MAX_CTRL_FRAME
-            and plen % 16 == 0
-        )
-
-
-# Type of the media sink: ``(seq, frame_bytes)`` where ``frame_bytes`` is one
-# complete media frame starting at its 64-byte AES head (what protocol.decode_media
-# expects). ``seq`` is a monotonically increasing counter -- TCP already orders
-# the stream, so it is informational only.
-MediaSink = Callable[[int, bytes], None]
+# Type of the media sink: called from the receive thread with every parsed
+# media packet, in stream order.
+MediaSink = Callable[[MediaPacket], None]
 
 
 class TcpStationTransport:
@@ -291,8 +163,6 @@ class TcpStationTransport:
         data_encode_key: str | None,
         client_id: str,
         oem: str = OEM_ID_COMPACT,
-        enable_audio: bool = False,
-        media_len_offset: int | None = MEDIA_LEN_OFFSET,
     ) -> None:
         """Prepare (but do not open) a session; see :meth:`connect`."""
         self._host = host
@@ -302,11 +172,6 @@ class TcpStationTransport:
         self._client_id = client_id
         self._oem = oem
         self._key = session_key(data_encode_key)
-        # The audio channel (CH1, a second socket) is not needed for camera +
-        # lock and is left unimplemented on purpose; the flag is accepted for API
-        # parity and only noted.
-        self._enable_audio = enable_audio
-        self._resolver = MediaLengthResolver(self._key, media_len_offset)
 
         # A fixed protocol timestamp for the stateless frames. The captured
         # keepalive is byte-identical across both connections and across runs,
@@ -319,8 +184,11 @@ class TcpStationTransport:
         self._sock: socket.socket | None = None
         self._buf = bytearray()
         self._on_media: MediaSink | None = None
-        self._media_seq = 0
-        self._since_login = 0
+        self._media_bytes = 0
+        self._resyncs = 0  # how often frame alignment was lost
+        self._aligned = True
+        self._unknown_types: set[int] = set()
+        self._door_answer: bytes | None = None
 
         self._stop = threading.Event()
         self._send_lock = threading.Lock()
@@ -333,6 +201,7 @@ class TcpStationTransport:
         # Public readiness signals.
         self.logged_in = threading.Event()  # first valid down frame parsed
         self.device_ready = threading.Event()  # app session free (0xFE msg13=2)
+        self.media_started = threading.Event()  # first media packet arrived
         self.station_silent = False  # station never answered the handshake
 
         # Down control-frame acks, for send_ctrl() / send_open() waiters. The
@@ -364,6 +233,7 @@ class TcpStationTransport:
         return (
             f"state={self._state} logged_in={self.logged_in.is_set()} "
             f"device_ready={self.device_ready.is_set()} "
+            f"media={self.media_started.is_set()} "
             f"peer_closed={self._peer_closed}"
         )
 
@@ -387,12 +257,6 @@ class TcpStationTransport:
         the recovery gap) from "silent" (retry immediately) apart.
         :meth:`close` must be called either way.
         """
-        if self._enable_audio:
-            _LOGGER.debug(
-                "Audio channel requested for %s but not implemented on the TCP "
-                "path -- continuing video + control only",
-                self._duid,
-            )
         try:
             return self._connect(timeout)
         except StationSilentError as err:
@@ -442,7 +306,7 @@ class TcpStationTransport:
 
         # 3. Raw LOGIN control frame (ftype 0x01, msg13=1, f15=f16=1 for CH0).
         login = ctrl_frame(
-            0x01,
+            FTYPE_LOGIN,
             self._ts,
             build_login_payload(self._dynamic_password, self._client_id, self._oem),
             self._key,
@@ -504,7 +368,7 @@ class TcpStationTransport:
         with self._send_lock:
             sock = self._sock
             if sock is None:
-                raise TransportError("socket is closed")
+                raise SessionClosedError("the session is closed")
             sock.sendall(data)
 
     def send_ctrl(
@@ -547,7 +411,7 @@ class TcpStationTransport:
                     if ftype == want_ftype and msg13 == want_msg13:
                         return (ftype, msg13)
                 remaining = deadline - time.monotonic()
-                if remaining <= 0 or self._peer_closed:
+                if remaining <= 0 or self._peer_closed or self._stop.is_set():
                     return (-1, -1)
                 self._ack_cv.wait(timeout=min(remaining, 0.2))
 
@@ -560,18 +424,22 @@ class TcpStationTransport:
         it. On the door path they precede the OPENDOOR frame.
         """
         for msg, msg13 in ((2, 5), (3, 6), (4, 2)):
-            self.send_ctrl(0xFE, msg, b"\x00", msg13=msg13)
+            self.send_ctrl(FTYPE_CONTROL, msg, b"\x00", msg13=msg13)
             time.sleep(0.02)
 
     def send_open(self, door: int, locknumber: int, pin_sha256: str) -> bool:
-        """Send the OPENDOOR frame exactly once and await the station's ack.
+        """Send the OPENDOOR frame exactly once and await the station's answer.
 
         ``ctrl_frame(0xFE, build_open_payload, msg13=4)`` on the video socket,
-        after :attr:`device_ready`. Returns ``True`` only when the station
-        acknowledges with its own ``0xFE msg13=4`` frame. The frame is sent
-        exactly ONCE and NEVER retried: a second send could open the door twice,
-        so an unacknowledged send returns ``False`` (sent-but-unacked, a hard
-        failure for the caller to surface, not retry).
+        after :attr:`device_ready`. The station answers with its own ``0xFE
+        msg13=4`` frame whose first payload byte is the result: ``00 01`` =
+        opened, ``01 00`` = refused (wrong door PIN; both verified live).
+
+        Returns ``True`` when the station opened the door and ``False`` when no
+        answer arrived (sent-but-unacknowledged: a hard failure for the caller to
+        surface). Raises :class:`DoorRejectedError` on a refusal and
+        :class:`StationBusyError` when the command provably never left. The
+        frame is NEVER retried here: a second send could open the door twice.
         """
         if not self.device_ready.is_set():
             raise StationBusyError(
@@ -580,8 +448,17 @@ class TcpStationTransport:
         payload = build_open_payload(door, locknumber, pin_sha256)
         with self._ack_cv:
             start = self._ack_total
+            self._door_answer = None
         try:
-            self._raw_send(ctrl_frame(0xFE, self._ts, payload, self._key, msg13=4))
+            self._raw_send(
+                ctrl_frame(
+                    FTYPE_CONTROL, self._ts, payload, self._key, msg13=MSG_OPENDOOR
+                )
+            )
+        except SessionClosedError as err:
+            raise StationBusyError(
+                f"the session with {self._duid} closed before OPENDOOR was sent"
+            ) from err
         except (OSError, TransportError) as err:
             raise TransportError(
                 f"the socket closed while sending OPENDOOR to {self._duid}: {err}"
@@ -592,17 +469,24 @@ class TcpStationTransport:
             door,
             locknumber,
         )
-        ftype, _ = self._wait_ack((0xFE, 4), OPENDOOR_ACK_TIMEOUT, start)
-        acked = ftype == 0xFE
-        if acked:
-            _LOGGER.debug("Door unlock confirmed by %s (0xFE msg13=4)", self._duid)
-        else:
+        ftype, _ = self._wait_ack(
+            (FTYPE_CONTROL, MSG_OPENDOOR), OPENDOOR_ACK_TIMEOUT, start
+        )
+        if ftype != FTYPE_CONTROL:
             _LOGGER.error(
                 "OPENDOOR to %s was sent but never acknowledged (0xFE msg13=4 not "
                 "seen). The door may or may not have opened -- not retrying.",
                 self._duid,
             )
-        return acked
+            return False
+        answer = self._door_answer or b""
+        if answer[:1] != DOOR_OPENED:
+            raise DoorRejectedError(
+                f"{self._duid} refused the door command (answer {answer.hex()}) -- "
+                "wrong door PIN?"
+            )
+        _LOGGER.debug("Door unlock confirmed by %s (0xFE msg13=4)", self._duid)
+        return True
 
     # --- Receiving -----------------------------------------------------------
 
@@ -615,76 +499,77 @@ class TcpStationTransport:
             try:
                 chunk = sock.recv(65536)
             except TimeoutError:
-                self._process_buffer()
                 continue
             except OSError:
-                self._peer_closed = True
-                self._wake_waiters()
-                return
+                chunk = b""
             if not chunk:
                 self._peer_closed = True
-                self._process_buffer(flush=True)
                 self._wake_waiters()
                 return
             self._buf += chunk
             self._process_buffer()
 
-    def _process_buffer(self, flush: bool = False) -> None:
-        """Consume whole frames from the receive buffer."""
+    def _process_buffer(self) -> None:
+        """Consume every complete frame in the receive buffer."""
         buf = self._buf
-        while True:
-            if len(buf) < 32:
-                return
-            head = cbc_decrypt(bytes(buf[:32]), self._key)
-            if head[_HEAD_TYPE] == _MEDIA_TYPE:
-                if len(buf) < MEDIA_HEAD_LEN:
-                    return
-                head64 = cbc_decrypt(bytes(buf[:MEDIA_HEAD_LEN]), self._key)
-                total = self._resolver.resolve(bytes(buf), head64, flush=flush)
-                if total is None or len(buf) < total:
-                    return
-                frame = bytes(buf[:total])
-                del buf[:total]
-                self._emit_media(frame)
-                continue
-            plen = head[_HEAD_PLEN]
-            if not (32 <= plen <= MAX_CTRL_FRAME and plen % 16 == 0):
+        while len(buf) >= HEAD_LEN:
+            head = parse_head(cbc_decrypt(bytes(buf[:HEAD_LEN]), self._key))
+            if head is None:
                 if not self._resync():
                     return
                 continue
-            total = 32 + plen
+            self._aligned = True
+            total = HEAD_LEN + head.body_len
             if len(buf) < total:
                 return
-            del buf[:total]
-            self._emit_control(head[_HEAD_TYPE], head[_HEAD_MSG13])
+            encrypted_end = HEAD_LEN + head.encrypted_len
+            plain = cbc_decrypt(bytes(buf[HEAD_LEN:encrypted_end]), self._key)
+            if head.is_media:
+                payload = plain + bytes(buf[encrypted_end:total])
+                del buf[:total]
+                self._emit_media(payload)
+            else:
+                del buf[:total]
+                self._emit_control(
+                    head.ftype, head.msg13, control_payload(head, plain)
+                )
 
     def _resync(self) -> bool:
-        """Drop bytes until the buffer starts on a decodable head again.
+        """Drop bytes until the buffer starts on a frame head again.
 
-        A safety net for a desync (a mis-resolved media length): normal control
-        and media boundaries are exact. Returns ``True`` once realigned.
+        A safety net only: frame boundaries are exact, so this runs when the key
+        is wrong or the station sends a frame type never seen before. Returns
+        ``True`` once realigned, ``False`` when more data is needed.
         """
         buf = self._buf
-        scan_limit = min(len(buf) - 32, MAX_MEDIA_FRAME)
-        for pos in range(1, scan_limit + 1):
-            head = cbc_decrypt(bytes(buf[pos : pos + 32]), self._key)
-            if head[_HEAD_TYPE] == _MEDIA_TYPE:
+        first = self._aligned and self._resyncs == 0
+        if self._aligned:
+            self._aligned = False
+            self._resyncs += 1
+        if first:
+            _LOGGER.warning(
+                "The stream from %s lost frame alignment -- resynchronising. "
+                "If this repeats, the station key may have rotated.",
+                self._duid,
+            )
+        for pos in range(1, len(buf) - HEAD_LEN + 1):
+            candidate = cbc_decrypt(bytes(buf[pos : pos + HEAD_LEN]), self._key)
+            if parse_head(candidate) is not None:
                 del buf[:pos]
                 return True
-            plen = head[_HEAD_PLEN]
-            if 32 <= plen <= MAX_CTRL_FRAME and plen % 16 == 0:
-                del buf[:pos]
-                return True
-        # Nothing found; keep only a tail that might hold the start of a head.
-        if len(buf) > 32:
-            del buf[: len(buf) - 32]
+        # Nothing found; keep only a tail that might hold the start of a head,
+        # so a persistent desync cannot grow the buffer without bound.
+        if len(buf) >= HEAD_LEN:
+            del buf[: len(buf) - (HEAD_LEN - 1)]
         return False
 
-    def _emit_media(self, frame: bytes) -> None:
-        self._media_seq += 1
-        self._since_login += len(frame)
+    def _emit_media(self, payload: bytes) -> None:
+        self._media_bytes += len(payload)
         self._mark_logged_in()
-        if not self.device_ready.is_set() and self._since_login > STREAM_IS_PROOF:
+        if not self.media_started.is_set():
+            self.media_started.set()
+            self._wake_waiters()
+        if not self.device_ready.is_set() and self._media_bytes > STREAM_IS_PROOF:
             self.device_ready.set()
             self._wake_waiters()
             _LOGGER.debug(
@@ -692,17 +577,45 @@ class TcpStationTransport:
                 self._duid,
             )
         sink = self._on_media
-        if sink is not None:
-            try:
-                sink(self._media_seq, frame)
-            except Exception:  # noqa: BLE001 -- a bad sink must not kill the RX loop
-                _LOGGER.exception("Media sink for %s raised", self._duid)
+        if sink is None:
+            return
+        packet = parse_media(payload)
+        if packet is None:
+            _LOGGER.debug(
+                "Unparsable media payload from %s (%d bytes)", self._duid, len(payload)
+            )
+            return
+        try:
+            sink(packet)
+        except Exception:  # noqa: BLE001 -- a bad sink must not kill the RX loop
+            _LOGGER.exception("Media sink for %s raised", self._duid)
 
-    def _emit_control(self, ftype: int, msg13: int) -> None:
+    def _emit_control(self, ftype: int, msg13: int, payload: bytes) -> None:
         self._mark_logged_in()
-        if ftype == 0xFE and msg13 == 2 and not self.device_ready.is_set():
+        if ftype == FTYPE_CONTROL and msg13 == MSG_HEARTBEAT:
+            return
+        if ftype not in KNOWN_FTYPES and ftype not in self._unknown_types:
+            self._unknown_types.add(ftype)
+            _LOGGER.debug(
+                "Station %s sent an unknown frame type 0x%02x (msg13=%d, %d bytes)"
+                " -- skipped",
+                self._duid,
+                ftype,
+                msg13,
+                len(payload),
+            )
+        if (
+            ftype == FTYPE_CONTROL
+            and msg13 == MSG_SESSION_READY
+            and not self.device_ready.is_set()
+        ):
             self.device_ready.set()
             _LOGGER.debug("Station %s signalled session ready (0xFE msg13=2)", self._duid)
+        if ftype == FTYPE_CONTROL and msg13 == MSG_OPENDOOR:
+            self._door_answer = payload
+            _LOGGER.debug(
+                "Station %s answered OPENDOOR with %s", self._duid, payload.hex()
+            )
         with self._ack_cv:
             self._ack_log.append((ftype, msg13))
             self._ack_total += 1
@@ -751,7 +664,7 @@ class TcpStationTransport:
         with self._ack_cv:
             while not event.is_set():
                 remaining = deadline - time.monotonic()
-                if remaining <= 0 or self._peer_closed:
+                if remaining <= 0 or self._peer_closed or self._stop.is_set():
                     break
                 self._ack_cv.wait(timeout=min(remaining, 0.2))
         return event.is_set()
@@ -771,7 +684,7 @@ class TcpStationTransport:
         if self._sock is not None and not self._peer_closed:
             # Best-effort close frame (ftype 0x07). Never fatal if it fails.
             try:
-                self._raw_send(ctrl_frame(0x07, self._ts, b"", self._key))
+                self._raw_send(ctrl_frame(FTYPE_CLOSE, self._ts, b"", self._key))
             except (OSError, TransportError):
                 pass
         sock = self._sock
@@ -801,7 +714,9 @@ class TcpStationTransport:
         """Send the 64-byte keepalive control frame every interval."""
         while not self._stop.wait(KEEPALIVE_INTERVAL):
             try:
-                self._raw_send(ctrl_frame(0x00, self._ts, b"", self._key))
+                self._raw_send(
+                    ctrl_frame(FTYPE_KEEPALIVE, self._ts, b"", self._key)
+                )
             except (OSError, TransportError):
                 self._peer_closed = True
                 self._wake_waiters()

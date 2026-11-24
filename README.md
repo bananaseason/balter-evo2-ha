@@ -10,10 +10,17 @@ sold under brands such as **Balter EVO** and **Homaxi**.
 
 ## Features
 
-- Camera entity with live view (bounded MJPEG) and cached snapshots
-- Lock entity for each door-release relay (momentary: unlocks, then re-locks after a few seconds)
-- `balter_evo2.record_clip` entity service: record 1 to 30 seconds to an MP4 file
+- **Camera** with a stored still image and an on-demand live view (768×432, about 18 frames
+  a second) that always ends by itself
+- **Lock** entity for each door-release relay (momentary: unlocks, then shows locked again
+  after a few seconds). The station's answer is read: "unlocked" means it really opened,
+  and a wrong door PIN is reported as such. Opening the door during a live view does not
+  interrupt the picture
+- Services for automations: `balter_evo2.start_live_view`, `stop_live_view`,
+  `refresh_snapshot` and `record_clip` (1 to 30 seconds as MP4)
 - Local push: video and door control go straight to the station over TCP port 34567
+- The station is never held: nothing is connected to it unless a live view runs or a
+  command is being sent, so the phone app and the indoor monitor keep working
 
 ## Supported devices
 
@@ -39,10 +46,90 @@ sold under brands such as **Balter EVO** and **Homaxi**.
    not reliably open a channel on every model and network. This integration uses the station's
    **direct TCP service** instead, which is simpler and fully local.
 
+## How the camera behaves
+
+A door station of this family serves **one client at a time**. A camera entity that keeps
+polling it would lock out the phone app, so this one does not:
+
+| Situation | What the entity does | Station contacted |
+| --- | --- | --- |
+| A dashboard shows the camera | serves the stored still (the last frame of the latest live view) | no (once, right after installing, to get a first still) |
+| Somebody opens the camera (more-info, a `camera_view: live` card) | starts a live view, ends it shortly after the last viewer left, at the latest after the *live view length* (90 s by default) | yes, for that time |
+| `balter_evo2.start_live_view` is called | runs a live view for its full length whether or not anybody watches | yes, for that time |
+| `balter_evo2.refresh_snapshot` is called | fetches one fresh still (about half a second) | yes, briefly |
+| Home Assistant restarts | brings the stored still back from disk | no |
+
+The camera state is `streaming` while a live view runs and `idle` otherwise; the attribute
+`still_taken` says when the stored still was taken.
+
+Keep in mind that every open MJPEG feed counts as a viewer. A card with `camera_view: live`
+that is always on screen (a wall tablet, for instance) starts a live view whenever it loads
+and keeps one alive for its full length; use the still (`camera_view: auto`) there and show
+the live card only on demand, as below.
+
+### Dashboard example
+
+The simplest card is a plain `picture-entity` with `camera_view: auto`: it shows the still,
+and a tap opens the camera dialog with the live view. If you prefer the picture to turn into
+live video in place when tapped, and back when the live view ends:
+
+```yaml
+- type: picture-entity
+  entity: camera.front_door
+  camera_view: auto
+  show_state: false
+  tap_action:
+    action: perform-action
+    perform_action: balter_evo2.start_live_view
+    target:
+      entity_id: camera.front_door
+    data:
+      end_when_unwatched: true
+  visibility:
+    - condition: state
+      entity: camera.front_door
+      state_not: streaming
+- type: picture-entity
+  entity: camera.front_door
+  camera_view: live
+  show_state: false
+  visibility:
+    - condition: state
+      entity: camera.front_door
+      state: streaming
+```
+
+### Live view when the doorbell rings
+
+The station reports a ring only through the vendor cloud (a push notification to the phone
+app), not on the local connection, so the integration has **no doorbell entity**. If the
+ring reaches Home Assistant another way (for example an Alexa or Google routine that turns
+on a helper), start the live view from that:
+
+```yaml
+triggers:
+  - trigger: state
+    entity_id: input_boolean.doorbell
+    to: "on"
+actions:
+  - action: balter_evo2.start_live_view
+    target:
+      entity_id: camera.front_door
+```
+
+## Options
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| Live view length | 90 s | Every live view ends after this time at the latest |
+| Refresh the still image after | 0 (never) | Fetch a fresh still by itself once the stored one is older while a dashboard shows it |
+| Keep session open | 0 s | Keep the connection after a command so the next one skips the handshake; while it is open the station turns other clients away |
+| Door PIN | empty | Only if you want to send a PIN other than the one registered in the cloud |
+| Host | from setup | Local address of the station |
+
 ## Screenshots
 
-> Screenshots of the setup flow and the camera / lock cards will be added here once the integration
-> is validated on real hardware.
+> Screenshots of the setup flow and the camera / lock cards will be added here.
 
 ## Requirements
 
@@ -71,10 +158,12 @@ directory and restart Home Assistant, then continue from step 4 above.
   address you enter; if it changes, use *Reconfigure* on the entry.
 - **Direct TCP, not UDP:** the station's UDP/P2P transport used by earlier community integrations
   proved unreliable, so this integration speaks the application protocol directly over TCP.
-- The station has a single session slot. Live streams are time-limited so the doorbell and
-  the phone app are not blocked; the connection used for unlocking is kept open only for the
-  configurable "keep session open" time.
-- The optional audio connection is off by default and not needed for camera and lock.
+- The station has a single session slot and needs about a second between two sessions;
+  the integration takes care of both. If the phone app or the indoor monitor is showing
+  the picture, a live view from Home Assistant may come up without video until they are
+  done.
+- Audio is not supported: the station's audio packets are skipped.
+- The wire protocol is documented in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## Security: do not expose the lock to voice assistants
 

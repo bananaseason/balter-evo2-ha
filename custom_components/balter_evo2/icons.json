@@ -2,6 +2,15 @@
   "services": {
     "record_clip": {
       "service": "mdi:video-box"
+    },
+    "start_live_view": {
+      "service": "mdi:video"
+    },
+    "stop_live_view": {
+      "service": "mdi:video-off"
+    },
+    "refresh_snapshot": {
+      "service": "mdi:camera-retake"
     }
   }
 }

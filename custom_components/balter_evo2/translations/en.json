@@ -59,18 +59,16 @@
         "data": {
           "door_pin": "Door PIN (optional)",
           "warm_idle": "Keep session open (seconds)",
-          "stream_duration": "Maximum live stream length (seconds)",
-          "snapshot_ttl": "Snapshot cache time (seconds)",
-          "host": "Host (IP address)",
-          "enable_audio": "Open the audio connection"
+          "stream_duration": "Live view length (seconds)",
+          "snapshot_ttl": "Refresh the still image after (seconds)",
+          "host": "Host (IP address)"
         },
         "data_description": {
-          "door_pin": "Leave empty to use the unlock code the door station has registered in the cloud. Only set this if you deliberately want to send a different PIN. A wrong PIN is rejected silently by the station.",
-          "warm_idle": "How long the connection to the door station stays open after a command. Within that window another press unlocks instantly instead of paying for the full handshake. While the connection is open the station is busy for the doorbell and the phone app, so do not set this higher than needed. 0 disables keeping it open.",
-          "stream_duration": "Every live stream is stopped after this time so the station's single slot is released for the doorbell and other residents.",
-          "snapshot_ttl": "How long a still image is reused before the station is contacted again.",
-          "host": "Local IP address or host name of the door station.",
-          "enable_audio": "Opens the second (audio) connection. Not needed for camera and lock; leave off unless you know you need it."
+          "door_pin": "Leave empty to use the unlock code the door station has registered in the cloud. Only set this if you deliberately want to send a different PIN. The station refuses a wrong PIN and the lock reports it.",
+          "warm_idle": "How long the connection to the door station stays open after a command. While it is open the station turns every other client away, the phone app included, so the default is 0: the station is released the moment a command is done.",
+          "stream_duration": "Every live view ends by itself after this time, so the station is free again for the phone app and the indoor monitor.",
+          "snapshot_ttl": "The camera shows a stored still, the last frame of the latest live view, and does not contact the station for it. Set a time here to have a fresh still fetched once the stored one is older while a dashboard shows it. 0 = never.",
+          "host": "Local IP address or host name of the door station."
         }
       }
     }
@@ -89,6 +87,28 @@
           "description": "Clip length in seconds."
         }
       }
+    },
+    "start_live_view": {
+      "name": "Start live view",
+      "description": "Starts a live view that ends by itself, for example when the doorbell rings. The camera state is \"streaming\" while it runs and the stored still is fresh afterwards.",
+      "fields": {
+        "duration": {
+          "name": "Duration",
+          "description": "Length in seconds. Defaults to the live view length from the options."
+        },
+        "end_when_unwatched": {
+          "name": "End when nobody watches",
+          "description": "Also end the live view a few seconds after the last viewer closed the picture. Use this for a dashboard button; leave it off for a doorbell automation, where the view should run even before anybody has opened it."
+        }
+      }
+    },
+    "stop_live_view": {
+      "name": "Stop live view",
+      "description": "Ends the running live view and releases the door station."
+    },
+    "refresh_snapshot": {
+      "name": "Refresh still image",
+      "description": "Fetches a fresh still image from the door station over one short connection."
     }
   }
 }

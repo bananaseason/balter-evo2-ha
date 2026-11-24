@@ -9,14 +9,15 @@ firmware demands:
 * **one session at a time** -- the station serves a single app session; a live
   view, a ringing call or the phone app blocks snapshot, stream and unlock. A
   per-station lock serialises every command here.
-* **a recovery gap** -- after a session ends the station needs ~60 s before it
-  will accept another (:data:`SESSION_MIN_GAP`); a command that starts too soon
-  stalls at LOGIN and *extends* the busy period. The gap is skipped only when the
-  station never took a session (it stayed silent).
-* **warm sessions** -- a session is kept open for ``warm_idle`` seconds after a
-  command so a second unlock (or a snapshot right after a stream) costs one frame
-  instead of a whole handshake, exactly as the official app feels. Unlike the
-  UDP path this needs no keepalive pump thread: the transport maintains itself.
+* **a short gap** -- after a session closes the station needs about a second
+  before the next one carries video (:data:`SESSION_MIN_GAP`); a session opened
+  sooner logs in but stays without video and is retried once. The gap is skipped
+  when the station never took a session (it stayed silent).
+* **nothing is held** -- a session is closed the moment its command is done, so
+  the phone app and the indoor monitor are not locked out. ``warm_idle`` (off by
+  default) can keep it open for a few seconds for a quick second command.
+* **a door command never waits for a live view** -- while one runs, the command
+  goes out over the live view's own session and the picture keeps running.
 
 Transport errors are mapped to the entity-facing exceptions that camera.py and
 lock.py expect (:class:`StationBusyError`, :class:`StationSilentError`).
@@ -41,6 +42,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import IO
 
 from homeassistant.core import HomeAssistant
 
@@ -48,13 +50,16 @@ from . import media, protocol
 from .const import (
     DEFAULT_WARM_IDLE,
     LOGIN_TIMEOUT,
+    MEDIA_START_TIMEOUT,
     OEM_ID_COMPACT,
     SESSION_MIN_GAP,
     STATION_PORT,
     STREAM_DURATION,
 )
 from .models import Credentials, Device
+from .protocol import MediaPacket
 from .transport import (
+    DoorRejectedError,
     StationBusyError,
     StationSilentError,
     TcpStationTransport,
@@ -65,6 +70,7 @@ _LOGGER = logging.getLogger(__name__)
 
 __all__ = [
     "StationManager",
+    "DoorRejectedError",
     "StationBusyError",
     "StationSilentError",
     "TransportError",
@@ -73,13 +79,12 @@ __all__ = [
 # How long the whole door-unlock session may take (handshake + readiness + ack).
 DOOR_SESSION_TIMEOUT = 20.0
 
-# Snapshot recording window: an upper bound. A still ends it as soon as a
-# parameter set and keyframe have arrived (usually ~2 s), which keeps a snapshot
-# inside the ten seconds Home Assistant allows a camera to answer in.
-SNAPSHOT_WINDOW = 8.0
+# Snapshot recording window: an upper bound. A still ends it as soon as the
+# first keyframe has arrived (about half a second after the login).
+SNAPSHOT_WINDOW = 6.0
 
-# A clip needs the full window; the station only starts sending ~2 s after login.
-CLIP_LEAD_SECONDS = 4.0
+# A clip records for its whole window; video starts ~0.5 s after the login.
+CLIP_LEAD_SECONDS = 1.0
 
 # A session kept open after a command is reused on the next one only while the
 # socket is still alive; nothing else is probed, since TCP self-maintains.
@@ -105,6 +110,7 @@ class UnlockResult:
     ready: bool = False  # station freed its app session
     sent: bool = False  # OPENDOOR left the client
     acked: bool = False  # station acknowledged (0xFE msg13=4)
+    rejected: bool = False  # station refused the command (wrong door PIN)
     silent: bool = False  # station never answered the handshake
 
     def __bool__(self) -> bool:
@@ -205,6 +211,7 @@ class StationManager:
         host_resolver: Callable[[Device], str | None],
         client_id: str | None = None,
         oem: str = OEM_ID_COMPACT,
+        warm_idle: float = DEFAULT_WARM_IDLE,
     ) -> None:
         """Create the manager.
 
@@ -212,18 +219,30 @@ class StationManager:
         station wanders without a DHCP reservation). ``client_id`` is the 16-hex
         identity put in the station LOGIN; the station accepts any well-formed id
         (verified live), so a throwaway one is generated when none is given.
+        ``warm_idle`` keeps a session open after a command for that many seconds.
         """
         self._hass = hass
         self._resolve_host = host_resolver
         self._client_id = (client_id or secrets.token_hex(8)).lower()
         self._oem = oem
+        # Seconds a session stays open after a command (0 = close at once).
+        self._warm_idle = max(float(warm_idle), 0.0)
 
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
         self._last_end: dict[str, float] = {}
         self._warm: dict[str, _WarmSession] = {}
         self._warm_guard = threading.Lock()
-        self._unlock_wanted: dict[str, bool] = {}
+        # Number of unlocks waiting for the slot, per station (a count, not a
+        # flag: two may wait at once and the first must not clear the second).
+        self._unlock_wanted: dict[str, int] = {}
+        self._unlock_guard = threading.Lock()
+        # Serialises door commands sent over a running live view and keeps the
+        # live view from closing its session while one is awaiting its answer.
+        self._live_locks: dict[str, threading.Lock] = {}
+        # Session of a running live view per station: a door command is sent
+        # over it instead of ending the view to open a session of its own.
+        self._live: dict[str, TcpStationTransport] = {}
         self._last_handshake: dict[str, str] = {}
 
     # --- Diagnostics ---------------------------------------------------------
@@ -275,7 +294,8 @@ class StationManager:
     ) -> bool:
         """Unlock a door relay. ``True`` on ack; ``False`` sent-but-unacked.
 
-        Raises :class:`StationBusyError` when the station never freed its session
+        Raises :class:`DoorRejectedError` when the station refused the command
+        (wrong door PIN), :class:`StationBusyError` when the station never freed its session
         (the command provably never went out -> safe to retry later) and
         :class:`StationSilentError` when it never answered at all (retry now, no
         recovery gap). A sent-but-unacknowledged open returns ``False`` and is
@@ -288,6 +308,10 @@ class StationManager:
         )
         if result.acked:
             return True
+        if result.rejected:
+            raise DoorRejectedError(
+                "The door station refused the command -- the door PIN is wrong."
+            )
         if result.sent:
             return False
         if result.silent:
@@ -453,22 +477,28 @@ class StationManager:
         slot: _Slot,
         device: Device,
         creds: Credentials,
-        on_media: Callable[[int, bytes], None],
+        on_media: Callable[[MediaPacket], None],
+        should_stop: Callable[[], bool] | None = None,
     ) -> TcpStationTransport | None:
-        """Return a logged-in session for a video command, or ``None``.
+        """Return a session that is delivering video, or ``None``.
 
-        Reuses a warm session the slot handed in (just re-point the media sink
-        and resend the setup frames); otherwise connects fresh and waits for the
-        login. There is no play command -- the station streams on its own once
-        the login is accepted.
+        Reuses a warm session the slot handed in (just re-point the media sink);
+        otherwise connects fresh. There is no play command -- the station streams
+        on its own once the login is accepted. A session that logs in but gets no
+        video (the station was reconnected to too soon, or somebody else is
+        watching) is closed and tried once more after the minimum gap.
         """
         transport = slot.transport
         if transport is not None:
-            if transport.is_alive:
+            if transport.is_alive and transport.media_started.is_set():
                 transport.set_media_sink(on_media)
-                transport.send_session_setup()
                 return transport
+            reached = transport.logged_in.is_set()
             slot.drop_transport()
+            if reached:
+                # It did occupy the station: the gap applies before reconnecting.
+                self._mark_session_end(device.duid)
+                time.sleep(SESSION_MIN_GAP)
 
         if not creds.dynamic_password:
             _LOGGER.error(
@@ -476,28 +506,54 @@ class StationManager:
             )
             return None
 
-        transport = self._make_transport(device, creds)
-        transport.set_media_sink(on_media)
-        slot.transport = transport
-        if not transport.connect(LOGIN_TIMEOUT):
+        for attempt in (1, 2):
+            transport = self._make_transport(device, creds)
+            transport.set_media_sink(on_media)
+            slot.transport = transport
+            connected = transport.connect(LOGIN_TIMEOUT)
+            if connected and transport.wait(transport.logged_in, LOGIN_TIMEOUT):
+                transport.send_session_setup()
+                if transport.wait(transport.media_started, MEDIA_START_TIMEOUT):
+                    self._record_handshake(transport)
+                    return transport
             self._record_handshake(transport)
-            return None
-        if transport.wait(transport.logged_in, LOGIN_TIMEOUT):
-            transport.send_session_setup()
-        else:
-            _LOGGER.warning(
-                "Login to %s not confirmed -- station busy?", device.duid
-            )
-        self._record_handshake(transport)
-        return transport
+            reached = transport.logged_in.is_set()
+            slot.drop_transport()
+            if not reached:
+                # Unreachable or refused: a second attempt would not differ.
+                return None
+            self._mark_session_end(device.duid)
+            if should_stop is not None and should_stop():
+                return None
+            if attempt == 1:
+                _LOGGER.debug(
+                    "Station %s opened a session without video -- retrying once",
+                    device.duid,
+                )
+                time.sleep(SESSION_MIN_GAP)
+        _LOGGER.warning(
+            "Station %s accepted the login but sent no video -- it is probably "
+            "serving another viewer (phone app or indoor monitor)",
+            device.duid,
+        )
+        return None
 
     # --- Priority signal (unlock preempts a running stream) ------------------
 
     def _set_unlock_wanted(self, duid: str, wanted: bool) -> None:
-        self._unlock_wanted[duid] = wanted
+        with self._unlock_guard:
+            count = self._unlock_wanted.get(duid, 0) + (1 if wanted else -1)
+            self._unlock_wanted[duid] = max(count, 0)
 
     def _unlock_pending(self, duid: str) -> bool:
-        return self._unlock_wanted.get(duid, False)
+        return self._unlock_wanted.get(duid, 0) > 0
+
+    def _live_lock(self, duid: str) -> threading.Lock:
+        with self._locks_guard:
+            lock = self._live_locks.get(duid)
+            if lock is None:
+                lock = self._live_locks[duid] = threading.Lock()
+            return lock
 
     def _release_or_hand_over(
         self, slot: _Slot, transport: TcpStationTransport, what: str
@@ -534,45 +590,48 @@ class StationManager:
     # --- Sync workers (executor thread) --------------------------------------
 
     def _snapshot_sync(self, device: Device, creds: Credentials) -> bytes | None:
-        h264 = self._grab_h264_sync(
-            device, creds, SNAPSHOT_WINDOW, DEFAULT_WARM_IDLE, stop_on_still=True
+        packets = self._grab_video_sync(
+            "Snapshot", device, creds, SNAPSHOT_WINDOW, stop_on_keyframe=True
         )
-        return media.h264_to_jpeg(h264) if h264 else None
+        keyframe = next((p for p in packets if p.is_keyframe), None)
+        return media.h264_to_jpeg(keyframe.data) if keyframe else None
 
     def _record_clip_sync(
         self, device: Device, creds: Credentials, seconds: float
     ) -> bytes | None:
         window = float(seconds) + CLIP_LEAD_SECONDS
-        h264 = self._grab_h264_sync(
-            device, creds, window, DEFAULT_WARM_IDLE, stop_on_still=False
+        packets = self._grab_video_sync(
+            "Clip", device, creds, window, stop_on_keyframe=False
         )
+        h264 = protocol.video_stream(packets)
         return media.h264_to_mp4(h264, seconds) if h264 else None
 
-    def _grab_h264_sync(
+    def _grab_video_sync(
         self,
+        purpose: str,
         device: Device,
         creds: Credentials,
         duration: float,
-        warm_idle: float,
-        stop_on_still: bool,
-    ) -> bytes | None:
-        """Open a session, collect media for ``duration`` and return raw H.264."""
-        key = protocol.session_key(creds.data_encode_key)
-        sink = _FrameSink()
+        stop_on_keyframe: bool,
+    ) -> list[MediaPacket]:
+        """Open a session, collect video for ``duration`` and return the packets."""
+        sink = _VideoSink()
         with self._slot(
-            "Snapshot", device.duid, self._signature(creds), reuse=True, warm_idle=warm_idle
+            purpose,
+            device.duid,
+            self._signature(creds),
+            reuse=True,
+            warm_idle=self._warm_idle,
         ) as slot:
             transport = self._video_session(slot, device, creds, sink)
             if transport is None:
-                slot.drop_transport()
-                return None
-            watcher = _StillWatcher(sink, key)
+                return []
             deadline = time.monotonic() + duration
 
             def _done() -> bool:
                 if self._unlock_pending(device.duid):
                     return True
-                return stop_on_still and watcher.ready()
+                return stop_on_keyframe and sink.has_keyframe
 
             try:
                 transport.run_until(deadline, until=_done)
@@ -580,13 +639,12 @@ class StationManager:
                 # A vanished socket is a stop, not a failure: keep what arrived.
                 _LOGGER.debug("Station %s closed mid-capture", device.duid)
             finally:
-                self._release_or_hand_over(slot, transport, "snapshot")
+                self._release_or_hand_over(slot, transport, purpose.lower())
 
-        frames = sink.snapshot()
-        if not frames:
-            _LOGGER.debug("No media received from %s", device.duid)
-            return None
-        return media.decode_media(frames, (key, protocol.FALLBACK_KEY))
+        packets = sink.packets()
+        if not packets:
+            _LOGGER.debug("No video received from %s", device.duid)
+        return packets
 
     def _stream_sync(
         self,
@@ -599,20 +657,22 @@ class StationManager:
         """Pipe the live H.264 stream through ffmpeg to JPEGs via ``on_jpeg``."""
         if on_jpeg is None:
             return 0
-        key = protocol.session_key(creds.data_encode_key)
-        frames_q: queue.Queue[bytes] = queue.Queue()
+        packets_q: queue.Queue[MediaPacket] = queue.Queue()
         with self._slot(
             "Live stream",
             device.duid,
             self._signature(creds),
             reuse=True,
-            warm_idle=DEFAULT_WARM_IDLE,
+            warm_idle=self._warm_idle,
         ) as slot:
             transport = self._video_session(
-                slot, device, creds, lambda _seq, frame: frames_q.put(frame)
+                slot, device, creds, packets_q.put, should_stop
             )
             if transport is None:
-                slot.drop_transport()
+                return 0
+            if should_stop is not None and should_stop():
+                # Stopped while the session was being set up.
+                self._release_or_hand_over(slot, transport, "live stream")
                 return 0
             ffmpeg = _start_mjpeg_transcoder()
             if ffmpeg is None:
@@ -629,13 +689,14 @@ class StationManager:
                     daemon=True,
                 ),
                 threading.Thread(
-                    target=_decrypt_pump,
-                    args=(ffmpeg, stop, frames_q, key),
-                    name=f"balter_evo2-decrypt-{device.duid}",
+                    target=_video_pump,
+                    args=(ffmpeg, stop, packets_q),
+                    name=f"balter_evo2-video-{device.duid}",
                     daemon=True,
                 ),
             ]
             deadline = time.monotonic() + (duration or STREAM_DURATION)
+            self._live[device.duid] = transport
             try:
                 for worker in workers:
                     worker.start()
@@ -650,9 +711,17 @@ class StationManager:
             except TransportError:
                 _LOGGER.debug("Station %s closed the live stream", device.duid)
             finally:
+                # Wait for a door command that is in flight on this session.
+                with self._live_lock(device.duid):
+                    self._live.pop(device.duid, None)
                 stop.set()
-                self._release_or_hand_over(slot, transport, "live stream")
-                _stop_ffmpeg(ffmpeg)
+                try:
+                    self._release_or_hand_over(slot, transport, "live stream")
+                finally:
+                    _stop_ffmpeg(ffmpeg)
+                    for worker in workers:
+                        if worker.is_alive():
+                            worker.join(timeout=1.0)
 
         _LOGGER.debug(
             "Live stream ended for %s (%d frames)", device.duid, frames_out[0]
@@ -676,6 +745,26 @@ class StationManager:
             return result
         pin_hash = pin_sha256 or protocol.SHA256_OF_EMPTY
 
+        # A live view is running: its session is logged in and ready, so the
+        # command goes out on it at once and the picture keeps running. The lock
+        # keeps the live view from closing that session until the answer is in.
+        with self._live_lock(device.duid):
+            live = self._live.get(device.duid)
+            if live is not None and live.is_alive and live.device_ready.is_set():
+                try:
+                    result.acked = live.send_open(door, locknumber, pin_hash)
+                except StationBusyError:
+                    pass  # provably not sent: take the normal path below
+                except DoorRejectedError:
+                    result.ready = result.sent = result.rejected = True
+                    return result
+                except TransportError:
+                    result.ready = result.sent = True
+                    return result
+                else:
+                    result.ready = result.sent = True
+                    return result
+
         self._set_unlock_wanted(device.duid, True)
         try:
             with self._slot(
@@ -683,7 +772,7 @@ class StationManager:
                 device.duid,
                 self._signature(creds),
                 reuse=True,
-                warm_idle=DEFAULT_WARM_IDLE,
+                warm_idle=self._warm_idle,
             ) as slot:
                 transport = slot.transport
                 if transport is not None and not transport.is_alive:
@@ -732,6 +821,9 @@ class StationManager:
                 except StationBusyError:
                     # device_ready was lost between the check and the send.
                     return result
+                except DoorRejectedError:
+                    result.sent = result.rejected = True
+                    return result
                 except TransportError:
                     # Socket died while sending: treat as sent-but-unacked so the
                     # caller surfaces a hard error and never auto-retries.
@@ -754,54 +846,28 @@ class StationManager:
 # --- Media collection --------------------------------------------------------
 
 
-class _FrameSink:
-    """Thread-safe media sink: collects whole media frames in arrival order."""
+class _VideoSink:
+    """Thread-safe media sink: collects the video packets in arrival order."""
 
     def __init__(self) -> None:
         """Start empty."""
         self._lock = threading.Lock()
-        self._frames: list[bytes] = []
+        self._packets: list[MediaPacket] = []
+        self.has_keyframe = False
 
-    def __call__(self, seq: int, frame: bytes) -> None:
-        """Append one media frame (called from the transport's receive thread)."""
+    def __call__(self, packet: MediaPacket) -> None:
+        """Keep one video packet (called from the transport's receive thread)."""
+        if not packet.is_video:
+            return
         with self._lock:
-            self._frames.append(frame)
+            self._packets.append(packet)
+            if packet.is_keyframe:
+                self.has_keyframe = True
 
-    def snapshot(self) -> list[bytes]:
-        """Return a copy of the frames collected so far."""
+    def packets(self) -> list[MediaPacket]:
+        """Return a copy of the packets collected so far."""
         with self._lock:
-            return list(self._frames)
-
-
-class _StillWatcher:
-    """Reports when a decodable picture (SPS + IDR) has arrived."""
-
-    _CHECK_INTERVAL = 0.25
-    _MIN_BYTES = 4096
-
-    def __init__(self, sink: _FrameSink, key: bytes) -> None:
-        """Watch ``sink`` for a complete still, decrypting with ``key``."""
-        self._sink = sink
-        self._key = key
-        self._next_check = 0.0
-        self._done = False
-
-    def ready(self) -> bool:
-        """Return whether a decodable still has arrived (rate-limited)."""
-        now = time.monotonic()
-        if self._done or now < self._next_check:
-            return self._done
-        self._next_check = now + self._CHECK_INTERVAL
-        frames = self._sink.snapshot()
-        if not frames:
-            return False
-        plain = bytearray()
-        for frame in frames:
-            plain += protocol.decrypt_head(frame, self._key)
-        if len(plain) < self._MIN_BYTES:
-            return False
-        self._done = protocol.h264_is_decodable(protocol.extract_h264(bytes(plain)))
-        return self._done
+            return list(self._packets)
 
 
 # --- Live MJPEG transcoding pipe ---------------------------------------------
@@ -820,6 +886,10 @@ def _start_mjpeg_transcoder() -> subprocess.Popen[bytes] | None:
                 "nobuffer",
                 "-flags",
                 "low_delay",
+                "-probesize",
+                "32768",
+                "-analyzeduration",
+                "0",
                 "-f",
                 "h264",
                 "-i",
@@ -827,12 +897,17 @@ def _start_mjpeg_transcoder() -> subprocess.Popen[bytes] | None:
                 "-f",
                 "mjpeg",
                 "-q:v",
-                "6",
+                "5",
+                "-flush_packets",
+                "1",
                 "pipe:1",
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            # Unbuffered pipes: a read returns what is there instead of waiting
+            # for a full block, so a frame is not held back until the next one.
+            bufsize=0,
         )
     except (OSError, ValueError) as err:
         _LOGGER.error(
@@ -844,14 +919,18 @@ def _start_mjpeg_transcoder() -> subprocess.Popen[bytes] | None:
 
 
 def _stop_ffmpeg(ffmpeg: subprocess.Popen[bytes]) -> None:
-    """Close the pipe and make sure the transcoder is gone."""
+    """Close the pipe and make sure the transcoder is gone.
+
+    Nothing still inside ffmpeg is wanted once a live view ends, so it is killed
+    rather than drained -- draining blocks on the output pipe nobody reads.
+    """
     if ffmpeg.stdin is not None:
         with contextlib.suppress(OSError):
             ffmpeg.stdin.close()
-    try:
+    with contextlib.suppress(OSError):
+        ffmpeg.kill()
+    with contextlib.suppress(subprocess.TimeoutExpired):
         ffmpeg.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        ffmpeg.terminate()
 
 
 def _jpeg_reader(
@@ -865,7 +944,7 @@ def _jpeg_reader(
         return
     buf = bytearray()
     while not stop.is_set():
-        chunk = ffmpeg.stdout.read(4096)
+        chunk = ffmpeg.stdout.read(65536)
         if not chunk:
             return
         buf.extend(chunk)
@@ -884,39 +963,41 @@ def _jpeg_reader(
                 on_jpeg(jpeg)
 
 
-def _decrypt_pump(
+def _video_pump(
     ffmpeg: subprocess.Popen[bytes],
     stop: threading.Event,
-    frames_q: queue.Queue[bytes],
-    key: bytes,
+    packets_q: queue.Queue[MediaPacket],
 ) -> None:
-    """Decrypt arriving media frames and feed them to ffmpeg.
+    """Feed the arriving video packets to ffmpeg, starting at a keyframe.
 
-    Everything before the first parameter set is dropped: ffmpeg cannot start on
-    a half frame. Only the unsynchronised head is buffered, so memory stays flat
-    however long the stream runs.
+    Audio packets are skipped and everything before the first keyframe is
+    dropped: a decoder cannot start on a delta frame.
     """
     if ffmpeg.stdin is None:
         return
-    presync = bytearray()  # decrypted bytes before the first NAL start code
-    synced = False
+    started = False
     while not stop.is_set():
         try:
-            frame = frames_q.get(timeout=0.2)
+            packet = packets_q.get(timeout=0.2)
         except queue.Empty:
             continue
-        chunk = bytearray(protocol.decrypt_head(frame, key))
-        if not synced:
-            presync += chunk
-            offset = protocol.first_nal_offset(presync)
-            if offset < 0:
-                del presync[:-8]  # a start code may straddle the boundary
+        if not packet.is_video:
+            continue
+        if not started:
+            if not packet.is_keyframe:
                 continue
-            chunk = presync[offset:]
-            presync.clear()
-            synced = True
+            started = True
         try:
-            ffmpeg.stdin.write(bytes(chunk))
-            ffmpeg.stdin.flush()
-        except (BrokenPipeError, OSError):
+            _write_all(ffmpeg.stdin, packet.data)
+        except (BrokenPipeError, OSError, ValueError):
             return
+
+
+def _write_all(pipe: IO[bytes], data: bytes) -> None:
+    """Write all of ``data`` to an unbuffered pipe (a raw write may be partial)."""
+    view = memoryview(data)
+    while view:
+        written = pipe.write(view)
+        if not written:
+            raise BrokenPipeError("the transcoder pipe closed")
+        view = view[written:]

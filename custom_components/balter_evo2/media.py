@@ -5,12 +5,11 @@ Pure subprocess work, executor-only -- never call these from the event loop.
 degrades gracefully: it returns ``None`` with a single clear log line when
 ffmpeg is missing or no decodable keyframe is present, and never raises.
 
-The actual codec (AES, head decryption, H.264 extraction, SPS+IDR candidate
-selection) lives in :mod:`protocol`; this module only shells out to ffmpeg.
+The codec itself (AES, frame and packet parsing) lives in :mod:`protocol`; this
+module only shells out to ffmpeg with ready-made H.264.
 
-Attribution: the still/clip ffmpeg invocations and the "pick the SPS+IDR
-candidate, never the longest" rule are ported from ``p2p.py`` of balter-evo-ha
-(https://github.com/LucaHerrero/balter-evo-ha, MIT licensed).
+Attribution: the still/clip ffmpeg invocations are ported from ``p2p.py`` of
+balter-evo-ha (https://github.com/LucaHerrero/balter-evo-ha, MIT licensed).
 """
 
 from __future__ import annotations
@@ -19,9 +18,6 @@ import logging
 import os
 import subprocess
 import tempfile
-from collections.abc import Iterable
-
-from . import protocol
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -29,25 +25,10 @@ _LOGGER = logging.getLogger(__name__)
 _STILL_TIMEOUT = 15.0
 _CLIP_TIMEOUT = 120.0
 
-# Clip frame-rate bounds. The station runs ~17 fps; clamp the estimate so a
+# Clip frame-rate bounds. The station runs ~18 fps; clamp the estimate so a
 # miscount cannot produce a comically fast or slow clip.
 _FPS_MIN = 5.0
 _FPS_MAX = 30.0
-
-
-def decode_media(
-    frames: Iterable[bytes], keys: Iterable[bytes]
-) -> bytes | None:
-    """Decrypt media frames and return the best H.264 elementary stream.
-
-    Thin wrapper over :func:`protocol.decode_media`: each frame starts at its
-    64-byte AES head (no outer header to skip on the TCP path), every candidate
-    key is tried, and the first stream carrying both a parameter set (SPS) and a
-    keyframe (IDR) wins -- *never* the longest, which is usually a wrongly
-    decrypted stream that still scans as H.264. Returns ``None`` when no
-    candidate holds usable video.
-    """
-    return protocol.decode_media(frames, keys)
 
 
 def run_ffmpeg(args: list[str], timeout: float) -> bool:
@@ -84,7 +65,10 @@ def h264_to_jpeg(h264: bytes) -> bytes | None:
         jpg = os.path.join(tmp_dir, "frame.jpg")
         with open(raw, "wb") as handle:
             handle.write(h264)
-        if not run_ffmpeg(["-y", "-i", raw, "-vframes", "1", jpg], _STILL_TIMEOUT):
+        if not run_ffmpeg(
+            ["-y", "-f", "h264", "-i", raw, "-frames:v", "1", "-q:v", "2", jpg],
+            _STILL_TIMEOUT,
+        ):
             return None
         if not os.path.exists(jpg) or os.path.getsize(jpg) == 0:
             _LOGGER.debug("ffmpeg produced no still image")

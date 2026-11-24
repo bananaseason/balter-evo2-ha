@@ -13,7 +13,9 @@ Quvii, Balter or Homaxi.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 import re
 import secrets
 from collections.abc import Mapping
@@ -22,17 +24,22 @@ from dataclasses import replace
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import aiohttp_client
+from homeassistant.helpers.storage import STORAGE_DIR
 
 from .api import BalterEvo2CloudClient
 from .const import (
     CONF_CLIENT_ID,
     CONF_HOST,
+    CONF_SNAPSHOT_TTL,
+    CONF_WARM_IDLE,
+    DEFAULT_WARM_IDLE,
+    DOMAIN,
     PLATFORMS,
 )
 from .coordinator import BalterEvo2Coordinator
 from .models import (
-    Device,
     BalterEvo2ConfigEntry,
+    Device,
     RuntimeData,
 )
 from .station import StationManager
@@ -120,7 +127,12 @@ async def async_setup_entry(
             device = replace(device, host=host)
         devices[duid] = device
 
-    manager = StationManager(hass, resolve_host)
+    manager = StationManager(
+        hass,
+        resolve_host,
+        client_id,
+        warm_idle=float(entry.options.get(CONF_WARM_IDLE, DEFAULT_WARM_IDLE)),
+    )
 
     entry.runtime_data = RuntimeData(
         client=client,
@@ -154,6 +166,22 @@ async def async_unload_entry(
     return unloaded
 
 
+async def async_remove_entry(
+    hass: HomeAssistant, entry: BalterEvo2ConfigEntry
+) -> None:
+    """Delete the entry's stored stills when it is removed for good."""
+    storage = hass.config.path(STORAGE_DIR)
+
+    def _purge() -> None:
+        with contextlib.suppress(OSError):
+            for name in os.listdir(storage):
+                if name.startswith(f"{DOMAIN}.{entry.entry_id}.") and name.endswith(".jpg"):
+                    with contextlib.suppress(OSError):
+                        os.remove(os.path.join(storage, name))
+
+    await hass.async_add_executor_job(_purge)
+
+
 async def async_reload_entry(
     hass: HomeAssistant, entry: BalterEvo2ConfigEntry
 ) -> None:
@@ -166,10 +194,23 @@ async def async_migrate_entry(
 ) -> bool:
     """Migrate an old config entry to the current schema.
 
-    Nothing predates version 1 of this (new-domain) integration yet; a future
-    downgrade is refused cleanly rather than risking a mangled entry.
+    1.1 -> 1.2 (integration 1.1.0): the options form of 1.0.0 stored its
+    defaults whenever it was saved -- a still refresh every 90 s and a 10 s
+    session hold. Both now default to off, so values that are exactly the old
+    defaults are dropped (a value somebody chose is kept); the audio option is
+    gone. A future major version is refused rather than risking a mangled entry.
     """
     if entry.version > 1:
         # Entry written by a newer version than this one -- do not touch it.
         return False
+    if entry.minor_version < 2:
+        options = dict(entry.options)
+        options.pop("enable_audio", None)
+        if options.get(CONF_SNAPSHOT_TTL) == 90:
+            options.pop(CONF_SNAPSHOT_TTL)
+        if options.get(CONF_WARM_IDLE) == 10:
+            options.pop(CONF_WARM_IDLE)
+        hass.config_entries.async_update_entry(
+            entry, options=options, minor_version=2
+        )
     return True

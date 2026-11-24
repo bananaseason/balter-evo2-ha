@@ -17,8 +17,15 @@ What is deliberately NOT here: the UDP transport header, KCP, the 56-byte
 them appear on the TCP stream, which carries the bare inner application frames:
 
 * a plaintext 32-byte ``a9`` setup body as the very first stream bytes,
-* control frames = :func:`ctrl_frame` output (AES-256-CBC, zero IV),
-* media frames = AES-encrypted 64-byte head followed by plaintext H.264.
+* control frames = :func:`ctrl_frame` output (AES-256-CBC, constant IV),
+* media frames = a 32-byte AES head, then ``content_len`` payload bytes of which
+  the first ``encrypted_len`` are AES encrypted and the rest is plaintext. The
+  payload is a 20-byte packet header (video / keyframe / audio, see
+  :class:`MediaPacket`) followed by the elementary stream.
+
+Every frame starts with the same 32-byte head and is self-delimiting through
+it, see :func:`parse_head`. This was verified against live captures of a Balter
+EVO 2: 1692 video frames in 93 s walked without a single resync.
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ from __future__ import annotations
 import hashlib
 import struct
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -51,8 +59,34 @@ SHA256_OF_EMPTY = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b
 
 # Frame geometry.
 A9_BODY_LEN = 32  # plaintext setup body / echo
-CTRL_HEAD_LEN = 32  # decrypted head of a control frame
-MEDIA_HEAD_LEN = 64  # AES-encrypted prefix of a media frame
+HEAD_LEN = 32  # AES-encrypted head every frame starts with
+CTRL_HEAD_LEN = HEAD_LEN  # historical name
+
+# Frame types (head byte 0).
+FTYPE_KEEPALIVE = 0x00
+FTYPE_LOGIN = 0x01
+FTYPE_CLOSE = 0x07
+FTYPE_MEDIA = 0xA0
+FTYPE_CONTROL = 0xFE
+KNOWN_FTYPES = frozenset(
+    {FTYPE_KEEPALIVE, FTYPE_LOGIN, FTYPE_CLOSE, FTYPE_MEDIA, FTYPE_CONTROL}
+)
+
+# Head field offsets (decrypted head).
+_HEAD_ENC_LEN = 9  # u16 LE: number of AES-encrypted bytes after the head
+_HEAD_CONTENT_LEN = 11  # u16 LE (control) / u32 LE (media): real content length
+_HEAD_MSG13 = 13  # control frames only: message id
+_HEAD_ZERO_FROM = 17  # bytes 17..31 (and 5..8) are zero in every frame captured
+
+# Upper bounds, only there to reject a mis-decrypted head.
+MAX_CTRL_BODY = 0xFFF0
+MAX_MEDIA_PAYLOAD = 4 << 20  # 4 MiB; a 768x432 keyframe is ~36 kB
+
+# Media packet header (first 20 bytes of a media payload).
+MEDIA_PACKET_HEAD_LEN = 20
+MEDIA_VIDEO = 0xE0  # H.264 delta frame (Annex B)
+MEDIA_KEYFRAME = 0xE1  # H.264 SPS + PPS + IDR (Annex B)
+MEDIA_AUDIO = 0xE3  # G.711 A-law, 8 kHz
 
 
 # --- AES -----------------------------------------------------------------------------
@@ -98,29 +132,25 @@ def ctrl_frame(
     """Build and encrypt an application control frame.
 
     Layout of the plaintext 32-byte head: ``ftype@0``, ``ts@1`` (u32 LE),
-    ``plen@9`` (padded length of payload + SHA-256 trailer), ``clen@0xb`` (real
-    payload length), ``msg13@0xd`` and flag bytes at 0xe..0x11. The head and the
+    ``plen@9`` (u16 LE, padded length of payload + SHA-256 trailer), ``clen@0xb``
+    (u16 LE, real payload length), ``msg13@0xd`` and flag bytes at 0xe..0x11. The head and the
     ``payload || SHA256(head || payload)`` body (zero padded to a block) are
     encrypted separately. An empty payload yields the 64-byte keepalive.
     """
     clen = len(payload)
-    nutzlen = clen + 32
-    plen = nutzlen + ((16 - nutzlen % 16) % 16)
-    if plen > 0xFF:
-        # ``head[9]`` is a single byte; a payload this large cannot be framed.
-        # Fail with a clear, mappable error instead of a raw bytearray
-        # assignment ValueError (reachable only with an abnormally long rotated
-        # dynamic password in the LOGIN payload).
+    body_len = clen + 32
+    plen = body_len + ((16 - body_len % 16) % 16)
+    if plen > MAX_CTRL_BODY:
         raise ValueError(
-            f"control payload too large: {clen} bytes -> plen {plen} exceeds the "
-            "one-byte frame-length field (max payload is 223 bytes)"
+            f"control payload too large: {clen} bytes -> body {plen} exceeds the "
+            f"16-bit frame-length field (max {MAX_CTRL_BODY})"
         )
-    head = bytearray(32)
+    head = bytearray(HEAD_LEN)
     head[0] = ftype
     struct.pack_into("<I", head, 1, ts)
-    head[9] = plen
-    head[11] = clen
-    head[13] = msg13
+    struct.pack_into("<H", head, _HEAD_ENC_LEN, plen)
+    struct.pack_into("<H", head, _HEAD_CONTENT_LEN, clen)
+    head[_HEAD_MSG13] = msg13
     head[14] = b14
     head[15] = f15
     head[16] = f16
@@ -171,86 +201,133 @@ def build_open_payload(door: int, locknumber: int, pin_sha256: str) -> bytes:
     return bytes(payload) + pin_sha256.encode("ascii")
 
 
-# --- Parsing / media -----------------------------------------------------------------------
+# --- Parsing ---------------------------------------------------------------------------------
 
 
-def decrypt_head(payload: bytes, key: bytes) -> bytes:
-    """Decrypt the 64-byte encrypted head of a frame, returning the full plaintext frame.
+@dataclass(frozen=True, slots=True)
+class FrameHead:
+    """The decoded 32-byte head of one frame on the stream."""
 
-    Everything after the first 64 bytes is already plaintext (H.264 Annex-B) and
-    is passed through unchanged. Payloads shorter than 64 bytes are returned as is.
+    ftype: int
+    encrypted_len: int  # AES-encrypted bytes that follow the head
+    content_len: int  # control: real payload length; media: whole payload length
+    msg13: int
+
+    @property
+    def is_media(self) -> bool:
+        """Return whether this is a media (``0xA0``) frame."""
+        return self.ftype == FTYPE_MEDIA
+
+    @property
+    def body_len(self) -> int:
+        """Return how many bytes follow the head on the wire.
+
+        A control frame is fully encrypted (payload + SHA-256 trailer, padded).
+        A media frame carries ``content_len`` bytes, only the first
+        ``encrypted_len`` of them encrypted.
+        """
+        return self.content_len if self.is_media else self.encrypted_len
+
+
+def parse_head(head: bytes) -> FrameHead | None:
+    """Decode a decrypted 32-byte head, or return ``None`` if it is not one.
+
+    ``None`` means the bytes are not a frame head (the stream is out of sync or
+    the key is wrong); it is never returned for a frame the station really sent.
+    The check is strict on purpose -- nineteen bytes that must be zero and a
+    block-aligned encrypted length -- so a resync cannot lock onto video data.
+    The type byte is deliberately NOT part of it: a frame type this code has
+    never seen still carries valid lengths and is skipped by them (as a control
+    frame) instead of costing a resync on every occurrence.
     """
-    if len(payload) < MEDIA_HEAD_LEN:
-        return payload
-    return cbc_decrypt(payload[:MEDIA_HEAD_LEN], key) + payload[MEDIA_HEAD_LEN:]
-
-
-def h264_is_decodable(buf: bytes) -> bool:
-    """Return True if the buffer carries a parameter set (SPS) and a keyframe (IDR).
-
-    Used to pick between decrypt candidates. Length is a misleading criterion: an
-    undecrypted raw stream is always the longest one because it still carries the
-    encrypted head of each media frame -- it scans as "H.264" but no decoder can
-    use it.
-    """
-    kinds = set()
-    p = buf.find(b"\x00\x00\x00\x01")
-    while p >= 0:
-        if p + 4 < len(buf):
-            kinds.add(buf[p + 4] & 0x1F)
-        p = buf.find(b"\x00\x00\x00\x01", p + 4)
-    return 7 in kinds and 5 in kinds
-
-
-def first_nal_offset(buf: bytes) -> int:
-    """Return the offset of the first usable H.264 NAL start code, or -1."""
-    for pattern in (
-        b"\x00\x00\x00\x01\x67",
-        b"\x00\x00\x00\x01\x27",  # SPS
-        b"\x00\x00\x00\x01\x68",
-        b"\x00\x00\x00\x01\x28",  # PPS
-        b"\x00\x00\x00\x01\x65",
-        b"\x00\x00\x00\x01\x25",  # IDR
-    ):
-        offset = buf.find(pattern)
-        if offset >= 0:
-            return offset
-    return -1
-
-
-def extract_h264(plain: bytes) -> bytes:
-    """Return the decrypted stream from its first valid H.264 NAL unit onwards."""
-    offset = first_nal_offset(plain)
-    return plain[offset:] if offset >= 0 else b""
-
-
-def decode_media(frames: Iterable[bytes], keys: Iterable[bytes]) -> bytes | None:
-    """Decrypt captured media frames and return the best H.264 elementary stream.
-
-    ``frames`` are complete media frames as delimited on the TCP stream, each
-    starting at its AES-encrypted 64-byte head (there is no outer header to
-    skip). Each candidate key is tried; the first stream containing SPS *and* IDR
-    wins, NOT the longest one: a wrongly decrypted stream is usually the longest
-    and still undecodable. Returns None if no candidate holds a decodable stream
-    -- a clean "no frame" is better than handing ffmpeg the longest (most likely
-    mis-decrypted) candidate.
-    """
-    frame_list = list(frames)
-    candidates = []
-    for key in dict.fromkeys(keys):  # skip duplicate keys
-        plain = bytearray()
-        for frame in frame_list:
-            plain += decrypt_head(frame, key)
-        stream = extract_h264(bytes(plain))
-        if len(stream) > 500:
-            candidates.append(stream)
-    if not candidates:
+    if len(head) < HEAD_LEN:
         return None
-    return next(
-        (stream for stream in candidates if h264_is_decodable(stream)),
-        None,
-    )
+    if any(head[_HEAD_ZERO_FROM:HEAD_LEN]) or any(head[5:_HEAD_ENC_LEN]):
+        return None
+    ftype = head[0]
+    encrypted_len = struct.unpack_from("<H", head, _HEAD_ENC_LEN)[0]
+    if encrypted_len % 16:
+        return None
+    if ftype == FTYPE_MEDIA:
+        content_len = struct.unpack_from("<I", head, _HEAD_CONTENT_LEN)[0]
+        if not (
+            MEDIA_PACKET_HEAD_LEN <= content_len <= MAX_MEDIA_PAYLOAD
+            and encrypted_len <= content_len
+        ):
+            return None
+        return FrameHead(ftype, encrypted_len, content_len, 0)
+    if not 32 <= encrypted_len <= MAX_CTRL_BODY:
+        return None
+    content_len = struct.unpack_from("<H", head, _HEAD_CONTENT_LEN)[0]
+    return FrameHead(ftype, encrypted_len, content_len, head[_HEAD_MSG13])
 
 
-# Historical alias of the upstream name.
-_decode_media = decode_media
+def control_payload(head: FrameHead, body: bytes) -> bytes:
+    """Return the real payload of a decrypted control-frame body.
+
+    The body is ``payload || SHA-256 || padding``. Some station replies (the
+    LOGIN answer) put a status word where the length normally sits, so the
+    length is clamped to what the body can hold.
+    """
+    return body[: min(head.content_len, max(len(body) - 32, 0))]
+
+
+@dataclass(frozen=True, slots=True)
+class MediaPacket:
+    """One media packet: a video frame, a keyframe or an audio chunk."""
+
+    kind: int  # MEDIA_VIDEO, MEDIA_KEYFRAME or MEDIA_AUDIO
+    timestamp: float  # station wall clock, seconds since the epoch
+    width: int  # video only, else 0
+    height: int  # video only, else 0
+    data: bytes  # H.264 Annex B (video) or G.711 A-law (audio)
+
+    @property
+    def is_video(self) -> bool:
+        """Return whether the packet carries H.264."""
+        return self.kind in (MEDIA_VIDEO, MEDIA_KEYFRAME)
+
+    @property
+    def is_keyframe(self) -> bool:
+        """Return whether the packet is a self-contained picture (SPS+PPS+IDR)."""
+        return self.kind == MEDIA_KEYFRAME
+
+
+def parse_media(payload: bytes) -> MediaPacket | None:
+    """Decode a decrypted media payload, or return ``None`` if it is malformed.
+
+    Packet header (20 bytes): ``00 00 01 <kind>``, data length (u32 LE), seconds
+    (u32 LE), milliseconds (u16 LE), then six codec bytes -- for video
+    ``01 64 <width u16> <height u16>``, for audio ``<fmt> 01 <rate u16> 00 00``.
+    """
+    if len(payload) < MEDIA_PACKET_HEAD_LEN or payload[:3] != b"\x00\x00\x01":
+        return None
+    kind = payload[3]
+    length, seconds, millis = struct.unpack_from("<IIH", payload, 4)
+    data = payload[MEDIA_PACKET_HEAD_LEN : MEDIA_PACKET_HEAD_LEN + length]
+    if len(data) != length:
+        return None
+    width = height = 0
+    if kind in (MEDIA_VIDEO, MEDIA_KEYFRAME):
+        width, height = struct.unpack_from("<HH", payload, 16)
+    return MediaPacket(kind, seconds + millis / 1000.0, width, height, bytes(data))
+
+
+def video_stream(packets: Iterable[MediaPacket]) -> bytes:
+    """Join the video packets into one H.264 stream, starting at a keyframe.
+
+    Everything before the first keyframe is dropped (a decoder cannot start on a
+    delta frame) and audio packets are skipped. Returns ``b""`` when no keyframe
+    is present.
+    """
+    out = bytearray()
+    started = False
+    for packet in packets:
+        if not packet.is_video:
+            continue
+        if not started:
+            if not packet.is_keyframe:
+                continue
+            started = True
+        out += packet.data
+    return bytes(out)

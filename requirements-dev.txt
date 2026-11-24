@@ -4,3 +4,5 @@ cryptography>=42.0.0
 # dependency on Home Assistant's ffmpeg component (import module: haffmpeg).
 ha-ffmpeg
 ruff
+# homeassistant.components.camera imports turbojpeg at module load.
+PyTurboJPEG

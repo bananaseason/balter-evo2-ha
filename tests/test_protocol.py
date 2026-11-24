@@ -17,7 +17,9 @@ from conftest import (
     TEST_KEY,
     TEST_OEM,
     TEST_PIN_SHA256,
-    build_media_frame,
+    build_head,
+    build_media_packet,
+    make_audio_chunk,
     make_h264_keyframe,
     make_h264_pframe,
     parse_ctrl_frame,
@@ -238,62 +240,271 @@ def test_capture_contains_repeating_keepalive_ciphertext(handshake_client: bytes
     assert repeated
 
 
-# --- decrypt_head ------------------------------------------------------------------------------------
+# --- removed helpers ----------------------------------------------------------------------------------
 
 
-def test_decrypt_head_roundtrip() -> None:
-    plain_head = bytes([0xA0]) + bytes(range(1, 64))
-    tail = b"\x00\x00\x00\x01\x65" + b"x" * 100
-    wire = p.cbc_encrypt(plain_head, TEST_KEY) + tail
-    assert p.decrypt_head(wire, TEST_KEY) == plain_head + tail
+@pytest.mark.parametrize(
+    "name",
+    [
+        "decrypt_head",
+        "first_nal_offset",
+        "extract_h264",
+        "decode_media",
+        "_decode_media",
+        "h264_is_decodable",
+        "MEDIA_HEAD_LEN",
+    ],
+)
+def test_old_media_helpers_are_gone(name: str) -> None:
+    assert not hasattr(p, name)
 
 
-def test_decrypt_head_short_passthrough() -> None:
-    assert p.decrypt_head(b"x" * 63, TEST_KEY) == b"x" * 63
-    assert p.decrypt_head(b"", TEST_KEY) == b""
+# --- control frames: 16-bit lengths -------------------------------------------------------------------------
 
 
-def test_decrypt_head_media_frame() -> None:
-    body = make_h264_keyframe()
-    frame = build_media_frame(TEST_KEY, body, ts=5)
-    plain = p.decrypt_head(frame, TEST_KEY)
-    assert plain[0] == 0xA0
-    assert plain[9] == 0x20
-    assert struct.unpack_from("<HH", plain, 0x30) == (352, 280)
-    assert plain[64 : 64 + len(body)] == body
+def _decrypted_head(frame: bytes) -> bytes:
+    return p.cbc_decrypt(frame[:32], TEST_KEY)
 
 
-# --- H.264 helpers ----------------------------------------------------------------------------------------
+@pytest.mark.parametrize("size", [0, 1, 200, 223, 224, 800, 4000])
+def test_ctrl_frame_roundtrips_through_parse_head_and_control_payload(size: int) -> None:
+    payload = bytes((i * 7 + 3) % 256 for i in range(size))
+    frame = p.ctrl_frame(0xFE, 0x01020304, payload, TEST_KEY, msg13=18)
+    head = p.parse_head(_decrypted_head(frame))
+    assert head is not None
+    assert head.ftype == 0xFE
+    assert head.msg13 == 18
+    assert head.content_len == size
+    assert not head.is_media
+    # padded payload + 32-byte SHA-256 trailer, block aligned
+    assert head.encrypted_len == (size + 32 + 15) // 16 * 16
+    assert head.body_len == head.encrypted_len
+    assert len(frame) == 32 + head.body_len
+    body = p.cbc_decrypt(frame[32:], TEST_KEY)
+    assert p.control_payload(head, body) == payload
+    head_plain = _decrypted_head(frame)
+    assert body[size : size + 32] == hashlib.sha256(head_plain + payload).digest()
+    assert not any(body[size + 32 :])  # zero padding
+    # and the conftest parser agrees
+    assert parse_ctrl_frame(frame, TEST_KEY) == (0xFE, 18, payload, len(frame))
 
 
-def test_h264_is_decodable() -> None:
-    assert p.h264_is_decodable(make_h264_keyframe())
-    assert not p.h264_is_decodable(b"\x00\x00\x00\x01\x41" + b"x" * 50)  # P frame only
-    assert not p.h264_is_decodable(b"\x00\x00\x00\x01\x67abc")  # SPS but no IDR
-    assert not p.h264_is_decodable(b"")
+def test_ctrl_frame_length_fields_are_16_bit_little_endian() -> None:
+    frame = p.ctrl_frame(0xFE, 0, bytes(800), TEST_KEY, msg13=18)
+    head = _decrypted_head(frame)
+    assert struct.unpack_from("<H", head, 9)[0] == 832  # 800 + 32 = 832, already aligned
+    assert struct.unpack_from("<H", head, 11)[0] == 800
+    assert head[13] == 18
+    assert not any(head[17:32])  # the head's tail stays zero
 
 
-def test_first_nal_offset_and_extract() -> None:
-    kf = make_h264_keyframe()
-    assert p.first_nal_offset(b"junk" + kf) == 4
-    assert p.first_nal_offset(b"nothing here") == -1
-    assert p.extract_h264(b"junk" + kf) == kf
-    assert p.extract_h264(b"no nal") == b""
+def test_ctrl_frame_largest_legal_payload_and_overflow() -> None:
+    biggest = p.MAX_CTRL_BODY - 32
+    frame = p.ctrl_frame(0xFE, 0, bytes(biggest), TEST_KEY, msg13=1)
+    head = p.parse_head(_decrypted_head(frame))
+    assert head is not None and head.content_len == biggest
+    with pytest.raises(ValueError):
+        p.ctrl_frame(0xFE, 0, bytes(biggest + 1), TEST_KEY)
 
 
-def test_decode_media_picks_decodable_candidate_not_longest() -> None:
-    kf = make_h264_keyframe()
-    frames = [build_media_frame(TEST_KEY, kf, ts=1), build_media_frame(TEST_KEY, make_h264_pframe(), ts=2)]
-    expected = p.extract_h264(b"".join(p.decrypt_head(f, TEST_KEY) for f in frames))
-    stream = p.decode_media(frames, [TEST_KEY, WRONG_KEY, TEST_KEY])  # duplicates tolerated
-    assert stream == expected
-    assert p.h264_is_decodable(stream)
-    assert stream.startswith(b"\x00\x00\x00\x01\x67")
-    # The first candidate that is decodable wins, not the longest one.
-    assert p.decode_media(frames, [TEST_KEY]) == expected
-    assert p._decode_media is p.decode_media
+def test_control_payload_clamps_to_body() -> None:
+    head = p.FrameHead(0x01, 48, 5000, 0)  # LOGIN answers carry a status word here
+    assert p.control_payload(head, bytes(range(48))) == bytes(range(16))
+    assert p.control_payload(head, b"") == b""
+    assert p.control_payload(head, bytes(10)) == b""
 
 
-def test_decode_media_none_without_h264() -> None:
-    assert p.decode_media([b"\x01" * 200], [TEST_KEY]) is None
-    assert p.decode_media([], [TEST_KEY]) is None
+# --- parse_head -----------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("ftype", [0x00, 0x01, 0x07, 0xFE])
+def test_parse_head_accepts_every_control_type(ftype: int) -> None:
+    head = p.parse_head(bytes(build_head(ftype, 48, 7, msg13=9)))
+    assert head == p.FrameHead(ftype, 48, 7, 9)
+    assert head.body_len == 48
+
+
+def test_parse_head_media() -> None:
+    head = p.parse_head(bytes(build_head(0xA0, 32, 70000)))
+    assert head == p.FrameHead(0xA0, 32, 70000, 0)
+    assert head.is_media
+    assert head.body_len == 70000  # a media frame is content_len bytes long on the wire
+
+
+def test_parse_head_media_without_encrypted_part() -> None:
+    head = p.parse_head(bytes(build_head(0xA0, 0, 20)))
+    assert head is not None and head.body_len == 20
+
+
+def test_parse_head_ignores_bytes_after_32() -> None:
+    raw = bytes(build_head(0xFE, 32, 0, msg13=8)) + b"\xff" * 10
+    assert p.parse_head(raw) == p.FrameHead(0xFE, 32, 0, 8)
+
+
+@pytest.mark.parametrize("ftype", [0x02, 0x42, 0x80, 0xA1, 0xFF, 0xE1])
+def test_parse_head_accepts_an_unknown_type_as_a_control_frame(ftype: int) -> None:
+    """The type byte is not checked: such a frame is skipped by its lengths."""
+    assert ftype not in p.KNOWN_FTYPES
+    head = p.parse_head(bytes(build_head(ftype, 64, 33, msg13=5)))
+    assert head == p.FrameHead(ftype, 64, 33, 5)
+    assert not head.is_media
+    assert head.body_len == 64
+
+
+def test_known_ftypes() -> None:
+    assert p.KNOWN_FTYPES == {0x00, 0x01, 0x07, 0xA0, 0xFE}
+
+
+@pytest.mark.parametrize("pos", [5, 6, 7, 8])
+@pytest.mark.parametrize("ftype", [0xFE, 0xA0, 0x42])
+def test_parse_head_rejects_nonzero_bytes_5_to_8(ftype: int, pos: int) -> None:
+    head = build_head(ftype, 32, 100)
+    head[pos] = 1
+    assert p.parse_head(bytes(head)) is None
+
+
+@pytest.mark.parametrize("pos", [17, 18, 24, 31])
+@pytest.mark.parametrize("ftype", [0xFE, 0xA0])
+def test_parse_head_rejects_nonzero_tail(ftype: int, pos: int) -> None:
+    head = build_head(ftype, 32, 100)
+    head[pos] = 1
+    assert p.parse_head(bytes(head)) is None
+
+
+@pytest.mark.parametrize("enc", [1, 17, 33, 47])
+def test_parse_head_rejects_unaligned_encrypted_len_control(enc: int) -> None:
+    assert p.parse_head(bytes(build_head(0xFE, enc, 0))) is None
+
+
+@pytest.mark.parametrize("enc", [1, 15, 17, 33])
+def test_parse_head_rejects_unaligned_encrypted_len_media(enc: int) -> None:
+    assert p.parse_head(bytes(build_head(0xA0, enc, 100))) is None
+
+
+@pytest.mark.parametrize("content", [0, 1, 19])
+def test_parse_head_rejects_media_shorter_than_packet_header(content: int) -> None:
+    assert p.parse_head(bytes(build_head(0xA0, 0, content))) is None
+
+
+def test_parse_head_rejects_media_content_shorter_than_encrypted_len() -> None:
+    assert p.parse_head(bytes(build_head(0xA0, 48, 32))) is None
+    assert p.parse_head(bytes(build_head(0xA0, 32, 32))) is not None  # equal is fine
+
+
+def test_parse_head_rejects_oversized_media() -> None:
+    assert p.parse_head(bytes(build_head(0xA0, 32, p.MAX_MEDIA_PAYLOAD + 1))) is None
+    assert p.parse_head(bytes(build_head(0xA0, 32, p.MAX_MEDIA_PAYLOAD))) is not None
+
+
+@pytest.mark.parametrize("enc", [0, 16])
+def test_parse_head_rejects_control_body_too_short_for_the_trailer(enc: int) -> None:
+    assert p.parse_head(bytes(build_head(0xFE, enc, 0))) is None
+
+
+def test_parse_head_rejects_short_input() -> None:
+    assert p.parse_head(b"") is None
+    assert p.parse_head(bytes(build_head(0xFE, 32, 0))[:31]) is None
+
+
+def test_parse_head_rejects_a_wrongly_decrypted_head() -> None:
+    frame = p.ctrl_frame(0xFE, 0, b"hello", TEST_KEY, msg13=4)
+    assert p.parse_head(p.cbc_decrypt(frame[:32], TEST_KEY)) is not None
+    assert p.parse_head(p.cbc_decrypt(frame[:32], WRONG_KEY)) is None
+
+
+# --- parse_media ------------------------------------------------------------------------------------------------------
+
+
+def test_parse_media_keyframe() -> None:
+    data = make_h264_keyframe()
+    packet = p.parse_media(
+        build_media_packet(p.MEDIA_KEYFRAME, data, seconds=1000, millis=250, width=768, height=432)
+    )
+    assert packet == p.MediaPacket(p.MEDIA_KEYFRAME, 1000.25, 768, 432, data)
+    assert packet.is_video and packet.is_keyframe
+
+
+def test_parse_media_delta_frame() -> None:
+    data = make_h264_pframe()
+    packet = p.parse_media(
+        build_media_packet(p.MEDIA_VIDEO, data, seconds=5, millis=999, width=352, height=288)
+    )
+    assert packet == p.MediaPacket(p.MEDIA_VIDEO, 5.999, 352, 288, data)
+    assert packet.is_video and not packet.is_keyframe
+
+
+def test_parse_media_audio() -> None:
+    data = make_audio_chunk()
+    packet = p.parse_media(build_media_packet(p.MEDIA_AUDIO, data, seconds=7, millis=40))
+    assert packet == p.MediaPacket(p.MEDIA_AUDIO, 7.04, 0, 0, data)
+    assert not packet.is_video and not packet.is_keyframe
+
+
+def test_media_kinds() -> None:
+    assert (p.MEDIA_VIDEO, p.MEDIA_KEYFRAME, p.MEDIA_AUDIO) == (0xE0, 0xE1, 0xE3)
+
+
+def test_parse_media_header_layout_is_byte_exact() -> None:
+    raw = build_media_packet(p.MEDIA_AUDIO, b"AB", seconds=1, millis=2)
+    assert raw == (
+        b"\x00\x00\x01\xe3"  # start code + kind
+        b"\x02\x00\x00\x00"  # data length
+        b"\x01\x00\x00\x00"  # seconds
+        b"\x02\x00"  # millis
+        b"\x04\x01\x40\x1f\x00\x00"  # audio codec bytes
+        b"AB"
+    )
+    video = build_media_packet(p.MEDIA_KEYFRAME, b"", width=768, height=432)
+    assert video[14:20] == b"\x01\x64" + struct.pack("<HH", 768, 432)
+
+
+def test_parse_media_ignores_trailing_bytes() -> None:
+    raw = build_media_packet(p.MEDIA_VIDEO, b"abc") + b"\x00" * 7
+    packet = p.parse_media(raw)
+    assert packet is not None and packet.data == b"abc"
+
+
+def test_parse_media_truncated_is_none() -> None:
+    raw = build_media_packet(p.MEDIA_KEYFRAME, make_h264_keyframe())
+    assert p.parse_media(raw) is not None
+    assert p.parse_media(raw[:-1]) is None  # one data byte missing
+    assert p.parse_media(raw[:25]) is None
+    assert p.parse_media(raw[:19]) is None  # shorter than the header
+    assert p.parse_media(b"") is None
+
+
+def test_parse_media_rejects_bad_start_code() -> None:
+    raw = bytearray(build_media_packet(p.MEDIA_VIDEO, b"abc"))
+    raw[2] = 0x02
+    assert p.parse_media(bytes(raw)) is None
+
+
+# --- video_stream -----------------------------------------------------------------------------------------------------------
+
+
+def _pkt(kind: int, data: bytes) -> p.MediaPacket:
+    return p.MediaPacket(kind, 0.0, 0 if kind == p.MEDIA_AUDIO else 768, 0, data)
+
+
+def test_video_stream_starts_at_first_keyframe_and_skips_audio() -> None:
+    packets = [
+        _pkt(p.MEDIA_VIDEO, b"d0"),  # leading delta frames are dropped
+        _pkt(p.MEDIA_AUDIO, b"a0"),
+        _pkt(p.MEDIA_VIDEO, b"d1"),
+        _pkt(p.MEDIA_KEYFRAME, b"K1"),
+        _pkt(p.MEDIA_AUDIO, b"a1"),
+        _pkt(p.MEDIA_VIDEO, b"d2"),
+        _pkt(p.MEDIA_AUDIO, b"a2"),
+        _pkt(p.MEDIA_KEYFRAME, b"K2"),  # later keyframes are kept
+        _pkt(p.MEDIA_VIDEO, b"d3"),
+    ]
+    assert p.video_stream(packets) == b"K1d2K2d3"
+
+
+def test_video_stream_without_keyframe_is_empty() -> None:
+    assert p.video_stream([_pkt(p.MEDIA_VIDEO, b"d"), _pkt(p.MEDIA_AUDIO, b"a")]) == b""
+    assert p.video_stream([]) == b""
+
+
+def test_video_stream_accepts_an_iterator() -> None:
+    assert p.video_stream(iter([_pkt(p.MEDIA_KEYFRAME, b"K"), _pkt(p.MEDIA_VIDEO, b"d")])) == b"Kd"

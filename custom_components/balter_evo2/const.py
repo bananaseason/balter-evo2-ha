@@ -35,9 +35,6 @@ CONF_DOOR_PIN = "door_pin"
 CONF_WARM_IDLE = "warm_idle"
 CONF_STREAM_DURATION = "stream_duration"
 CONF_SNAPSHOT_TTL = "snapshot_ttl"
-# The audio connection (CH1) is not needed for camera + lock and defaults to off.
-CONF_ENABLE_AUDIO = "enable_audio"
-DEFAULT_ENABLE_AUDIO = False
 
 # --- Timeouts (seconds) -------------------------------------------------------
 
@@ -79,29 +76,43 @@ DEFAULT_STREAM_DURATION = STREAM_DURATION
 # is aborted.
 STREAM_STOP_TIMEOUT = 5.0
 
-# Minimum age before a new still image is fetched. Must exceed the slot cycle
-# (SESSION_MIN_GAP + one snapshot, roughly 70 s): a shorter value lets an open
-# dashboard hold the station permanently, starving the doorbell, the app and the
-# door opener.
-SNAPSHOT_CACHE_TTL = 90.0
-DEFAULT_SNAPSHOT_TTL = SNAPSHOT_CACHE_TTL
+# The camera shows a stored still (the last frame of the latest live view) and
+# never opens a station session just because a dashboard is on screen. This
+# optional age makes it fetch a fresh still by itself once the stored one is
+# older; 0 (the default) turns that off, so the station is only ever contacted
+# for a live view, an explicit snapshot refresh or a door command.
+SNAPSHOT_TTL_NEVER = 0.0
+DEFAULT_SNAPSHOT_TTL = SNAPSHOT_TTL_NEVER
+SNAPSHOT_TTL_MAX = 3600.0
+
+# Entity services of the camera for automations (e.g. "doorbell rang").
+SERVICE_START_LIVE_VIEW = "start_live_view"
+SERVICE_STOP_LIVE_VIEW = "stop_live_view"
+SERVICE_REFRESH_SNAPSHOT = "refresh_snapshot"
+ATTR_DURATION = "duration"
+ATTR_END_WHEN_UNWATCHED = "end_when_unwatched"
+STREAM_DURATION_MIN = 10.0
+STREAM_DURATION_MAX = 300.0
 
 # --- Session slot management ----------------------------------------------------
 
-# The station serves only ONE app session at a time and needs recovery time after
-# it: an attempt that starts while it is still busy extends the busy period.
-# Snapshot, live stream and door opening therefore share one slot and keep this
-# minimum gap (observed 60-90 s; 30 s was too short -- an open exactly 30 s after
-# the previous session stalled at LOGIN). Applies only after a session that
-# actually occupied the station.
-SESSION_MIN_GAP = 60.0
+# The station serves only ONE app session at a time. Snapshot, live stream and
+# door opening therefore share one slot. After a session closes the station needs
+# a moment before it serves video again: a reconnect within ~0.5 s is accepted
+# but gets a session WITHOUT video, from 1 s on it works (measured live on a
+# Balter EVO 2). Applies only after a session that actually reached the station.
+SESSION_MIN_GAP = 2.0
 
-# How long a session is kept open after a command. Re-establishing it costs
-# several seconds, which is why the official app opens instantly on a second
-# press: it keeps the session and only sends the command. The value trades
-# "second open immediately" against "station free again quickly" and is
-# therefore configurable in the options. 0 disables keeping sessions warm.
-DEFAULT_WARM_IDLE = 10.0
+# How long to wait for the first video packet after the login. It normally
+# arrives within half a second; none at all means the station opened the session
+# without video (reconnected too soon, or somebody else is watching).
+MEDIA_START_TIMEOUT = 3.0
+
+# How long a session is kept open after a command, so that a following command
+# skips the handshake. Off by default: while a session stands, the station turns
+# every other client away -- the phone app included -- so the integration lets go
+# of it the moment a command is done. Configurable in the options.
+DEFAULT_WARM_IDLE = 0.0
 WARM_IDLE_MAX = 60.0
 
 # --- Cloud credentials cache ------------------------------------------------------

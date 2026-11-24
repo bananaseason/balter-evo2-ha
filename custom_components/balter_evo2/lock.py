@@ -21,7 +21,6 @@ import hashlib
 import logging
 from typing import Any
 
-from homeassistant.components import persistent_notification
 from homeassistant.components.lock import LockEntity
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
@@ -35,7 +34,12 @@ from .api import BalterEvo2ApiError
 from .const import CONF_DOOR_PIN, DOMAIN, MANUFACTURER, RELOCK_DELAY
 from .coordinator import BalterEvo2Coordinator
 from .models import Device, DoorLock
-from .station import StationBusyError, StationManager, StationSilentError
+from .station import (
+    DoorRejectedError,
+    StationBusyError,
+    StationManager,
+    StationSilentError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -122,17 +126,16 @@ class BalterEvo2DoorLock(CoordinatorEntity[BalterEvo2Coordinator], LockEntity):
                 None if self._pin else (creds.out_auth_code or None)
             )
 
-            # A wrong PIN cannot be detected from outside: the device simply never
-            # acks the OPENDOOR frame. The cloud knows the right hash, so compare
-            # here and log the suspicion instead of guessing later.
+            # The station refuses a wrong PIN (see DoorRejectedError below). The
+            # cloud knows the right hash, so a mismatch is already visible here.
             expected_hash = creds.out_auth_code or ""
             if self._pin and expected_hash:
                 own_hash = hashlib.sha256(self._pin.encode("utf-8")).hexdigest()
                 if own_hash != expected_hash:
                     _LOGGER.warning(
                         "The door PIN stored in Home Assistant does not match the "
-                        "station's out-auth-code. The device will probably refuse "
-                        "the open silently. Correct the PIN in the integration "
+                        "station's out-auth-code. The station will refuse the "
+                        "command. Correct the PIN in the integration "
                         "options or leave it empty to use the cloud hash."
                     )
                 else:
@@ -154,6 +157,13 @@ class BalterEvo2DoorLock(CoordinatorEntity[BalterEvo2Coordinator], LockEntity):
                     "The door opener did not acknowledge the command. The door "
                     "was probably not opened; do not retry automatically."
                 )
+        except DoorRejectedError as err:
+            _LOGGER.warning("Door unlock refused by %s: %s", self._duid, err)
+            raise HomeAssistantError(
+                "The door station refused the command: the door PIN is wrong. "
+                "Correct it in the integration options, or leave it empty to use "
+                "the code registered for the station."
+            ) from err
         except StationSilentError as err:
             # The station never answered, so it accepted no session: the next
             # attempt may start immediately, no recovery gap needed.
@@ -166,9 +176,9 @@ class BalterEvo2DoorLock(CoordinatorEntity[BalterEvo2Coordinator], LockEntity):
             # The command provably never went out -> safe to try again later.
             _LOGGER.warning("Door unlock could not start: %s", err)
             raise HomeAssistantError(
-                "The door station is still busy with an earlier session and did "
-                "not release the connection. Please wait about a minute and then "
-                "open ONCE more -- quick repeats only keep the station busy longer."
+                "The door station is busy with another session (the phone app or "
+                "the indoor monitor?) and did not accept the command. Nothing was "
+                "sent; try again in a few seconds."
             ) from err
         except BalterEvo2ApiError as err:
             # No usable login secret could be loaded (cloud down, nothing cached).
@@ -184,17 +194,10 @@ class BalterEvo2DoorLock(CoordinatorEntity[BalterEvo2Coordinator], LockEntity):
             _LOGGER.error("Door unlock failed: %s", err)
             raise HomeAssistantError(f"Door open failed: {err}") from err
 
-        # The device really acknowledged the open. For users opening remotely who
-        # cannot hear the buzzer, the HA UI is the only feedback -- show a short
-        # confirmation on top of flipping the state.
+        # The station confirmed that it opened; the entity shows "unlocked" for
+        # RELOCK_DELAY seconds as the feedback for users who cannot hear the buzzer.
         _LOGGER.info(
             "Door unlock confirmed by device for %s (%s)", self.name, self._duid
-        )
-        persistent_notification.async_create(
-            self.hass,
-            f"{self.name}: open command confirmed by the door station.",
-            title="Qualvision",
-            notification_id=f"{DOMAIN}_unlock_{self._attr_unique_id}",
         )
         self._attr_is_locked = False
         self.async_write_ha_state()

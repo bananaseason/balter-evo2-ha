@@ -3,9 +3,11 @@
 Home Assistant integration for door stations built on the Qualvision / Quvii platform
 (Balter EVO, Homaxi and other OEM brands).
 
-- Camera: live view and snapshots over a direct local TCP connection
+- Camera: a stored still image plus an on-demand live view (768x432, ~18 fps) over a direct
+  local TCP connection; the live view always ends by itself
 - Lock: door opener as a momentary lock entity
-- `balter_evo2.record_clip` service for short MP4 clips
+- Services: `start_live_view`, `stop_live_view`, `refresh_snapshot`, `record_clip`
+- The station is not held between uses, so the phone app keeps working
 
 Sign in with your phone app account, then give the station's local address. Requires ffmpeg.
 

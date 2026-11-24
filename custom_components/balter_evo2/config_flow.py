@@ -29,17 +29,16 @@ from .api import BalterEvo2ApiError, BalterEvo2AuthError, BalterEvo2CloudClient
 from .const import (
     CONF_CLIENT_ID,
     CONF_DOOR_PIN,
-    CONF_ENABLE_AUDIO,
     CONF_HOST,
     CONF_SNAPSHOT_TTL,
     CONF_STREAM_DURATION,
     CONF_WARM_IDLE,
-    DEFAULT_ENABLE_AUDIO,
     DEFAULT_SNAPSHOT_TTL,
     DEFAULT_STREAM_DURATION,
     DEFAULT_WARM_IDLE,
     DOMAIN,
     LOGIN_TIMEOUT,
+    SNAPSHOT_TTL_MAX,
     STATION_PORT,
     WARM_IDLE_MAX,
 )
@@ -73,6 +72,7 @@ class BalterEvo2ConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle the Qualvision config flow."""
 
     VERSION = 1
+    MINOR_VERSION = 2
 
     def __init__(self) -> None:
         """Initialise the flow's cross-step state."""
@@ -268,7 +268,7 @@ class BalterEvo2ConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class BalterEvo2OptionsFlow(OptionsFlow):
-    """Options: door PIN, session hold time, stream/snapshot behaviour, host, audio."""
+    """Options: door PIN, session hold time, live view / still behaviour, host."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -285,9 +285,6 @@ class BalterEvo2OptionsFlow(OptionsFlow):
                 ),
                 CONF_SNAPSHOT_TTL: float(
                     user_input.get(CONF_SNAPSHOT_TTL, DEFAULT_SNAPSHOT_TTL)
-                ),
-                CONF_ENABLE_AUDIO: bool(
-                    user_input.get(CONF_ENABLE_AUDIO, DEFAULT_ENABLE_AUDIO)
                 ),
             }
             host = (user_input.get(CONF_HOST) or "").strip()
@@ -339,19 +336,13 @@ class BalterEvo2OptionsFlow(OptionsFlow):
                     ),
                 ): selector.NumberSelector(
                     selector.NumberSelectorConfig(
-                        min=30,
-                        max=600,
-                        step=5,
+                        min=0,
+                        max=SNAPSHOT_TTL_MAX,
+                        step=10,
                         unit_of_measurement="s",
                         mode=selector.NumberSelectorMode.BOX,
                     )
                 ),
-                vol.Optional(
-                    CONF_ENABLE_AUDIO,
-                    default=bool(
-                        current.get(CONF_ENABLE_AUDIO, DEFAULT_ENABLE_AUDIO)
-                    ),
-                ): bool,
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)

@@ -19,3 +19,37 @@ record_clip:
           step: 1
           unit_of_measurement: s
           mode: slider
+
+start_live_view:
+  target:
+    entity:
+      integration: balter_evo2
+      domain: camera
+  fields:
+    duration:
+      required: false
+      example: 90
+      selector:
+        number:
+          min: 10
+          max: 300
+          step: 5
+          unit_of_measurement: s
+          mode: box
+    end_when_unwatched:
+      required: false
+      default: false
+      selector:
+        boolean:
+
+stop_live_view:
+  target:
+    entity:
+      integration: balter_evo2
+      domain: camera
+
+refresh_snapshot:
+  target:
+    entity:
+      integration: balter_evo2
+      domain: camera

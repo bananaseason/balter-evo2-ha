@@ -59,18 +59,16 @@
         "data": {
           "door_pin": "Tür-PIN (optional)",
           "warm_idle": "Sitzung offen halten (Sekunden)",
-          "stream_duration": "Maximale Livestream-Dauer (Sekunden)",
-          "snapshot_ttl": "Snapshot-Cachezeit (Sekunden)",
-          "host": "Host (IP-Adresse)",
-          "enable_audio": "Audioverbindung öffnen"
+          "stream_duration": "Dauer der Live-Ansicht (Sekunden)",
+          "snapshot_ttl": "Standbild erneuern nach (Sekunden)",
+          "host": "Host (IP-Adresse)"
         },
         "data_description": {
-          "door_pin": "Leer lassen, damit der in der Cloud hinterlegte Öffnungscode der Türstation verwendet wird. Nur eintragen, wenn du bewusst eine abweichende PIN senden willst. Eine falsche PIN lehnt die Station stillschweigend ab.",
-          "warm_idle": "Wie lange die Verbindung zur Türstation nach einem Befehl offen bleibt. In dieser Zeit öffnet ein weiterer Druck sofort, statt den kompletten Verbindungsaufbau zu bezahlen. Solange die Verbindung offen ist, ist die Station für Klingel und Handy-App belegt, darum nicht höher setzen als nötig. 0 schaltet das Offenhalten ab.",
-          "stream_duration": "Jeder Livestream wird nach dieser Zeit beendet, damit der einzelne Slot der Station für Klingel und andere Bewohner frei wird.",
-          "snapshot_ttl": "Wie lange ein Standbild wiederverwendet wird, bevor die Station erneut kontaktiert wird.",
-          "host": "Lokale IP-Adresse oder Hostname der Türstation.",
-          "enable_audio": "Öffnet die zweite (Audio-)Verbindung. Für Kamera und Schloss nicht nötig; ausgeschaltet lassen, außer du brauchst sie."
+          "door_pin": "Leer lassen, damit der in der Cloud hinterlegte Öffnungscode der Türstation verwendet wird. Nur eintragen, wenn du bewusst eine abweichende PIN senden willst. Eine falsche PIN lehnt die Station ab; das Schloss meldet es.",
+          "warm_idle": "Wie lange die Verbindung zur Türstation nach einem Befehl offen bleibt. Solange sie steht, weist die Station jeden anderen Client ab, auch die Handy-App. Standard ist daher 0: Die Station wird sofort nach dem Befehl freigegeben.",
+          "stream_duration": "Jede Live-Ansicht endet nach dieser Zeit von selbst, damit die Station wieder für die Handy-App und den Innenmonitor frei ist.",
+          "snapshot_ttl": "Die Kamera zeigt ein gespeichertes Standbild, das letzte Bild der jüngsten Live-Ansicht, und kontaktiert die Station dafür nicht. Mit einer Zeit hier wird ein neues Standbild geholt, sobald das gespeicherte älter ist und ein Dashboard es anzeigt. 0 = nie.",
+          "host": "Lokale IP-Adresse oder Hostname der Türstation."
         }
       }
     }
@@ -89,6 +87,28 @@
           "description": "Cliplänge in Sekunden."
         }
       }
+    },
+    "start_live_view": {
+      "name": "Live-Ansicht starten",
+      "description": "Startet eine Live-Ansicht, die von selbst endet, zum Beispiel wenn es klingelt. Solange sie läuft, ist der Zustand der Kamera \"streaming\"; danach ist das gespeicherte Standbild aktuell.",
+      "fields": {
+        "duration": {
+          "name": "Dauer",
+          "description": "Länge in Sekunden. Standard ist die Dauer der Live-Ansicht aus den Optionen."
+        },
+        "end_when_unwatched": {
+          "name": "Beenden, wenn niemand zusieht",
+          "description": "Die Live-Ansicht endet zusätzlich wenige Sekunden, nachdem der letzte Betrachter das Bild geschlossen hat. Für eine Dashboard-Schaltfläche einschalten; für eine Klingel-Automation aus lassen, damit die Ansicht schon läuft, bevor jemand sie öffnet."
+        }
+      }
+    },
+    "stop_live_view": {
+      "name": "Live-Ansicht beenden",
+      "description": "Beendet die laufende Live-Ansicht und gibt die Türstation frei."
+    },
+    "refresh_snapshot": {
+      "name": "Standbild erneuern",
+      "description": "Holt über eine kurze Verbindung ein neues Standbild von der Türstation."
     }
   }
 }
