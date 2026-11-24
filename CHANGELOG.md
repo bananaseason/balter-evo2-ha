@@ -2,10 +2,21 @@
 
 ## 1.1.1 (2026-11-24)
 
+### Fixed
+
+- **Live view stuttered in the dark or on a quiet picture** (about 4 frames a second
+  reached the viewer although the station recorded 15). Small frames arrived in clumps:
+  the station holds a small write back until the previous one is acknowledged, and Home
+  Assistant's side delayed its acknowledgements. They are now sent at once
+  (`TCP_QUICKACK`), and the viewer gets every frame.
+
 ### Changed
 
 - A live view that somebody opened now ends one second after the last viewer closed it
   (was four), so the station is free again practically at once.
+
+- The debug log line at the end of a live view says how many frames arrived, at what rate
+  the station recorded them and how long the longest gap was.
 
 ### Notes
 

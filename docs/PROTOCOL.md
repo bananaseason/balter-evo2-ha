@@ -120,6 +120,11 @@ blocky, slow picture that an unpinned parser shows.
   two seconds between sessions and retries once if a session comes up without video.
 - A door command is accepted on a session that is streaming video, and the stream
   keeps running.
+- It writes every frame separately and waits for the acknowledgement of a small write
+  before sending the next (Nagle). A client that delays its ACKs gets small frames, a
+  dark or motionless picture, in clumps a few times a second; acknowledge at once
+  (`TCP_QUICKACK` on Linux, set again after every read).
+- The frame rate follows the light: about 18 frames a second by day, about 15 in the dark.
 
 ## Not known
 

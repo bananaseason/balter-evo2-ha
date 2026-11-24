@@ -665,8 +665,15 @@ class StationManager:
             reuse=True,
             warm_idle=self._warm_idle,
         ) as slot:
+            arrivals = _ArrivalStats()
+
+            def _on_packet(packet: MediaPacket) -> None:
+                if packet.is_video:
+                    arrivals.add(packet.timestamp)
+                packets_q.put(packet)
+
             transport = self._video_session(
-                slot, device, creds, packets_q.put, should_stop
+                slot, device, creds, _on_packet, should_stop
             )
             if transport is None:
                 return 0
@@ -724,7 +731,10 @@ class StationManager:
                             worker.join(timeout=1.0)
 
         _LOGGER.debug(
-            "Live stream ended for %s (%d frames)", device.duid, frames_out[0]
+            "Live stream ended for %s (%d frames shown; %s)",
+            device.duid,
+            frames_out[0],
+            arrivals.summary(),
         )
         return frames_out[0]
 
@@ -844,6 +854,48 @@ class StationManager:
 
 
 # --- Media collection --------------------------------------------------------
+
+
+class _ArrivalStats:
+    """How evenly the video frames of one live view arrived (for the debug log).
+
+    Compares the station's own clock on the frames with the time they reached
+    us: a station that records 18 frames a second but delivers them in clumps
+    shows as a capture rate well above what the gaps suggest.
+    """
+
+    def __init__(self) -> None:
+        """Start empty."""
+        self.count = 0
+        self._first_seen = self._last_seen = 0.0
+        self._first_stamp = self._last_stamp = 0.0
+        self._long_gaps = 0
+        self._max_gap = 0.0
+
+    def add(self, stamp: float) -> None:
+        """Note one video frame carrying the station time ``stamp``."""
+        now = time.monotonic()
+        if self.count == 0:
+            self._first_seen, self._first_stamp = now, stamp
+        else:
+            gap = now - self._last_seen
+            self._max_gap = max(self._max_gap, gap)
+            if gap > 0.2:
+                self._long_gaps += 1
+        self._last_seen, self._last_stamp = now, stamp
+        self.count += 1
+
+    def summary(self) -> str:
+        """Return a one-line description."""
+        if self.count < 2:
+            return f"{self.count} video frames received"
+        seen = max(self._last_seen - self._first_seen, 0.001)
+        recorded = max(self._last_stamp - self._first_stamp, 0.001)
+        return (
+            f"{self.count} video frames received in {seen:.1f}s, recorded at "
+            f"{(self.count - 1) / recorded:.1f}/s, {self._long_gaps} gaps over "
+            f"0.2s, longest {self._max_gap:.2f}s"
+        )
 
 
 class _VideoSink:

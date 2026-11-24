@@ -136,6 +136,25 @@ MSG_PROFILE = 18  # JSON description of the station's channels and locks
 DOOR_OPENED = b"\x00"
 
 
+def _quick_ack(sock: socket.socket) -> None:
+    """Acknowledge what was received right away (Linux; a no-op elsewhere).
+
+    The station sends every frame as its own small write and, like any TCP
+    sender with Nagle's algorithm, holds the next small write back until the
+    previous one is acknowledged. A receiver that delays its ACKs (the default)
+    therefore gets small frames -- a quiet or dark picture -- in clumps instead
+    of one by one, which shows as stutter. The option is not sticky, so it is
+    set again after every read.
+    """
+    option = getattr(socket, "TCP_QUICKACK", None)
+    if option is None:
+        return
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, option, 1)
+    except OSError:
+        pass
+
+
 # Type of the media sink: called from the receive thread with every parsed
 # media packet, in stream order.
 MediaSink = Callable[[MediaPacket], None]
@@ -284,6 +303,7 @@ class TcpStationTransport:
                 f"Could not reach the door station at {self._host}:{self._port}: {err}"
             ) from err
         sock.settimeout(RX_POLL_TIMEOUT)
+        _quick_ack(sock)
         self._sock = sock
         self._state = "CONNECTED"
 
@@ -506,6 +526,7 @@ class TcpStationTransport:
                 self._peer_closed = True
                 self._wake_waiters()
                 return
+            _quick_ack(sock)
             self._buf += chunk
             self._process_buffer()
 
