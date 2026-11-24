@@ -167,7 +167,7 @@ class BalterEvo2DoorLock(CoordinatorEntity[BalterEvo2Coordinator], LockEntity):
             raise HomeAssistantError(
                 f"The door station refused to open this lock (answer "
                 f"{err.answer.hex() or 'none'}). The door PIN was accepted; the "
-                "station does not open this lock for the app."
+                "station does not know this lock."
             ) from err
         except StationSilentError as err:
             # The station never answered, so it accepted no session: the next

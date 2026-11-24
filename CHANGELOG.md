@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.1.3 (2026-11-24)
+
+### Fixed
+
+- **The second door opener was refused and the first one was the wrong one for stations
+  wired to lock 2.** The door command carried the lock number and the door-station number
+  in each other's place. With one lock that makes no difference; on an EVO 2 with two locks
+  "lock 2" went out as "door station 2", which the station does not have. The order now
+  matches what the phone app sends (taken from a capture of the app's door button).
+  *Door opener* is the app's padlock button, *Door opener 2* its door button.
+
+### Changed
+
+- [docs/PROTOCOL.md](docs/PROTOCOL.md) describes the audio channel and the talk-back
+  frames of the phone app. Two-way audio is not implemented yet.
+
+### Upgrading
+
+Update and restart Home Assistant. If your door hangs on the second lock, point your
+dashboard button at *Door opener 2*.
+
 ## 1.1.2 (2026-11-24)
 
 ### Fixed

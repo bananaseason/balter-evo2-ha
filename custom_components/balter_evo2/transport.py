@@ -97,7 +97,8 @@ class DoorRejectedError(TransportError):
     """The station answered the door command with a refusal.
 
     ``answer`` is the station's two-byte answer: ``01 00`` for a wrong door PIN,
-    ``01 01`` for a lock it does not open (seen for the second lock of an EVO 2).
+    ``01 01`` for a target it does not have (seen for door station 2 of a
+    one-door EVO 2).
     """
 
     def __init__(self, message: str, answer: bytes = b"") -> None:
@@ -140,8 +141,9 @@ MSG_OPENDOOR = 4  # OPENDOOR and its acknowledgement
 MSG_HEARTBEAT = 8  # station tick, about once a second while streaming
 MSG_PROFILE = 18  # JSON description of the station's channels and locks
 
-# First payload byte of the station's OPENDOOR answer when it opened the door
-# (``00 01``); a refusal is ``01 00``.
+# First payload byte of the station's OPENDOOR answer when it accepted the
+# command (``00 00`` to the phone app, ``00 01`` to this client; what the second
+# byte says is not known); a refusal starts with ``01``.
 DOOR_OPENED = b"\x00"
 DOOR_WRONG_PIN = b"\x01\x00"
 
@@ -463,8 +465,8 @@ class TcpStationTransport:
 
         ``ctrl_frame(0xFE, build_open_payload, msg13=4)`` on the video socket,
         after :attr:`device_ready`. The station answers with its own ``0xFE
-        msg13=4`` frame whose first payload byte is the result: ``00 01`` =
-        opened, ``01 00`` = refused (wrong door PIN; both verified live).
+        msg13=4`` frame whose first payload byte is the result: ``00`` =
+        accepted, ``01 00`` = wrong door PIN, ``01 01`` = no such target.
 
         Returns ``True`` when the station opened the door and ``False`` when no
         answer arrived (sent-but-unacknowledged: a hard failure for the caller to

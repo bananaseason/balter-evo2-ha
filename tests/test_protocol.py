@@ -221,12 +221,20 @@ def test_default_oem_matches_const() -> None:
 def test_open_payload_layout() -> None:
     payload = p.build_open_payload(2, 3, TEST_PIN_SHA256)
     assert len(payload) == 16 + 64
-    assert payload[0] == 2
-    assert payload[2] == 3
+    assert payload[0] == 3  # lock number
+    assert payload[2] == 2  # door station
     assert payload[3] == 1
     assert payload[16:] == TEST_PIN_SHA256.encode("ascii")
     frame = p.ctrl_frame(0xFE, 0, payload, TEST_KEY, msg13=4)
     assert parse_ctrl_frame(frame, TEST_KEY)[:3] == (0xFE, 4, payload)  # type: ignore[index]
+
+
+def test_open_payload_of_the_second_lock_is_what_the_phone_app_sends() -> None:
+    """Captured from the app on an EVO 2: its second button, door PIN 0000."""
+    pin = "9af15b336e6a9619928537df30b2e6a2376569fcf9d7e773eccede65606529a0"
+    captured = bytes.fromhex("02000101" + "00" * 12) + pin.encode("ascii")
+    assert p.build_open_payload(1, 2, pin) == captured
+    assert p.build_open_payload(1, 1, pin)[:4] == bytes.fromhex("01000101")
 
 
 # --- capture ciphertext properties (no key needed) -----------------------------------------------

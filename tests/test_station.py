@@ -568,7 +568,7 @@ async def test_open_door_true_only_on_ack(
     assert await manager.async_open_door(device, creds, 2, 3, TEST_PIN_SHA256) is True
     ((_f, msg13, payload, _raw),) = station.opens()
     assert msg13 == 4
-    assert payload[0] == 2 and payload[2] == 3
+    assert payload[0] == 3 and payload[2] == 2  # lock number, then door station
     assert payload[16:] == TEST_PIN_SHA256.encode()
 
 

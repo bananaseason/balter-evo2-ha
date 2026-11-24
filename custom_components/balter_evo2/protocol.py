@@ -193,10 +193,17 @@ def build_login_payload(dynpw: str, client_id: str, oem: str = DEFAULT_OEM) -> b
 
 
 def build_open_payload(door: int, locknumber: int, pin_sha256: str) -> bytes:
-    """Build the payload of the OPENDOOR (ftype 0xFE, msg13=4) frame."""
+    """Build the payload of the OPENDOOR (ftype 0xFE, msg13=4) frame.
+
+    Byte 0 is the lock number, byte 2 the door station (channel), byte 3 the
+    action (1 = open). The order comes from a capture of the phone app on an
+    EVO 2 with two locks: its second button sends ``02 00 01 01``. With the two
+    numbers the other way round the station takes "lock 2" for a door station
+    it does not have and refuses (``01 01``).
+    """
     payload = bytearray(16)
-    payload[0] = door
-    payload[2] = locknumber
+    payload[0] = locknumber
+    payload[2] = door
     payload[3] = 1
     return bytes(payload) + pin_sha256.encode("ascii")
 

@@ -12,7 +12,8 @@ sold under brands such as **Balter EVO** and **Homaxi**.
 
 - **Camera** with a stored still image and an on-demand live view (768×432, about 18 frames
   a second) that always ends by itself
-- **Lock** entity for each door opener the station has (an EVO 2 has two; momentary:
+- **Lock** entity for each door opener the station has (an EVO 2 has two: *Door opener* is
+  the padlock button of the phone app, *Door opener 2* its door button; momentary:
   unlocks, then shows locked again after a few seconds). The station's answer is read:
   "unlocked" means the station accepted the command, a wrong door PIN and a lock the
   station refuses to open are reported as such. Opening the door during a live view does

@@ -76,7 +76,7 @@ Note the 16-bit length: the profile the station sends right after the login is a
 | `msg13` | Direction | Meaning |
 | --- | --- | --- |
 | 2 | both | session setup / session ready |
-| 4 | client | **open door**: payload 16 bytes (`door`, 0, `lock number`, 1, zeros) + 64 ASCII hex characters, the SHA-256 of the door PIN |
+| 4 | client | **open door**: payload 16 bytes (`lock number`, 0, `door station`, 1, zeros) + 64 ASCII hex characters, the SHA-256 of the door PIN |
 | 4 | station | open-door answer, two bytes, see below |
 | 5, 6 | client | setup frames the app sends after its LOGIN |
 | 8 | station | heartbeat with a counter, about once a second |
@@ -89,17 +89,21 @@ An open-door command that is sent before that answer can be dropped without any 
 (seen with the command sent 230 ms before the answers arrived). The phone app sends the
 command only while its picture runs.
 
+The two buttons of the phone app on an EVO 2 (a padlock and a door) are lock 1 and
+lock 2 of door station 1. The door button sends `02 00 01 01`: the lock number comes
+first, the door station third. (With one lock and one door station both are 1, which is
+why the order cannot be read from a capture of such a unit.)
+
 Answers to the open-door command, as seen on an EVO 2 (`IDS94A6FW`):
 
 | Answer | When |
 | --- | --- |
-| `00 01` | lock 1, right PIN: accepted, 60 ms after the command |
-| `01 00` | lock 1, wrong PIN |
-| `01 01` | lock 2, right PIN: refused, although the station lists the lock as enabled |
-| `00 00` | a real opening by the phone app on another unit, 1.9 s after the command (from the notes of balter-evo-ha) |
+| `00 00` | the phone app, lock 2, right PIN, 120 ms after the command |
+| `00 01` | this integration, lock 1 or lock 2, right PIN, 60 to 90 ms after the command |
+| `01 00` | wrong PIN (the app and this integration) |
+| `01 01` | door station 2, which this unit does not have (the result of sending the two numbers the other way round) |
 
-The first byte is taken as the result (0 = accepted). What the second byte says is not
-known, and neither is whether `00 01` and `00 00` mean the same thing.
+The first byte is the result (0 = accepted). What the second byte says is not known.
 
 Locks are named by the cloud's sub-device list and by the station's profile with codes
 such as `Channel_1 lock1`, `Channel_1 lock2` (EVO 2), `lock_chn1 1` or `door1-lock1`:
@@ -148,11 +152,41 @@ blocky, slow picture that an unpinned parser shows.
   (`TCP_QUICKACK` on Linux, set again after every read).
 - The frame rate follows the light: about 18 frames a second by day, about 15 in the dark.
 
+## The audio channel and talk-back
+
+Seen in a capture of the phone app (there over its UDP transport, where both channels
+share one connection; the frames are the same). **Not implemented by this integration.**
+
+The audio channel is a second channel opened with the setup body `a9 … [9] = 02`:
+
+| Step | Direction | Frame |
+| --- | --- | --- |
+| 1 | client | LOGIN with type `0x0B`, `msg13 = 0xFF`, head byte 14 `0xFF`, the same payload as the video LOGIN |
+| 2 | station | type `0x0B`, no payload |
+| 3 | client | type `0x0C` (audio format): `msg13 = 1`, head bytes 15..16 = sample rate (`40 1f` = 8000), then type `0x0D` with `msg13 = 1` (not talking) |
+| 4 | station | type `0x0C`, then `0x0D` |
+| talk | client | type `0x0D`, `msg13 = 0`: talking starts; the station answers `0x0D` |
+| talk | client | type `0xA2` every 40 ms: the microphone audio |
+| end | client | type `0x0D`, `msg13 = 1`: talking ends; the station answers `0x0D` |
+
+The frames of types `0x0B` (answer), `0x0C` and `0x0D` carry no payload: the head is
+followed by 32 encrypted bytes, the SHA-256 of the decrypted head, and the client puts
+`ff ff` into the content length.
+
+A talk frame (`0xA2`) is laid out like a media frame (32 encrypted bytes, u32 content
+length) and holds `00 00 01 f0 0e 02`, the data length as u16 LE (`40 01` = 320) and
+320 bytes of G.711 A-law, 8 kHz: 40 ms.
+
+While the app shows the picture, the station's own audio (kind `0xE3`) arrives on the
+video channel, not on the audio channel.
+
 ## Not known
 
 - Whether a higher-resolution stream can be requested. The station sends 768×432
   unasked; no command that selects another stream has been identified.
 - The meaning of the two-byte answers to the setup frames (`00 05`, `01 01`).
-- The talk-back (microphone) direction and the second, audio-only connection.
+- Whether the audio channel and talk-back work on a second TCP connection the way they do
+  on the app's UDP transport.
+- The second byte of the open-door answer.
 - How a doorbell press is signalled locally, if it is at all: the station reports rings
   through the vendor cloud as push notifications.

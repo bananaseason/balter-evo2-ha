@@ -76,8 +76,8 @@ def _empty_credentials() -> dict[str, str]:
 
 # The cloud writes lock codes as "Channel_1 lock2" (EVO 2 IDS94A6FW, observed
 # live), "lock_chn1 1" or "door1-lock1", depending on the firmware. All of them
-# mean channel (= door station) and lock number, both 1-based -- exactly the
-# indices the OPENDOOR frame carries.
+# mean channel (= door station) and lock number, both 1-based -- the two
+# indices the OPENDOOR frame carries (lock number first, see protocol.py).
 _LOCK_CODE_RES = (
     re.compile(
         r"^channel[ _-]*(?P<door>\d+)[ _-]+lock[ _-]*(?P<lock>\d+)$", re.IGNORECASE
