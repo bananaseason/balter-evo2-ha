@@ -89,11 +89,15 @@ class Card:
             self._changed.set()
 
     async def wait(
-        self, predicate: Callable[[dict[str, Any]], bool], timeout: float = 5.0
+        self,
+        predicate: Callable[[dict[str, Any]], bool],
+        timeout: float = 5.0,
+        since: int = 0,
     ) -> dict[str, Any]:
+        """Return the first message from index ``since`` on that matches."""
         end = time.monotonic() + timeout
         while True:
-            for msg in self.messages:
+            for msg in self.messages[since:]:
                 if predicate(msg):
                     return msg
             remaining = end - time.monotonic()
@@ -133,7 +137,9 @@ class Card:
     def states(self) -> list[dict[str, Any]]:
         return self.events("state")
 
-    async def wait_state(self, timeout: float = 5.0, **fields: Any) -> dict[str, Any]:
+    async def wait_state(
+        self, timeout: float = 5.0, since: int = 0, **fields: Any
+    ) -> dict[str, Any]:
         msg = await self.wait(
             lambda m: (
                 m["type"] == "event"
@@ -142,6 +148,7 @@ class Card:
                 and all(m["event"].get(k) == v for k, v in fields.items())
             ),
             timeout,
+            since,
         )
         return msg["event"]
 
@@ -645,9 +652,10 @@ async def test_talk_opens_the_microphone_channel_and_toggles_it(
     assert await until(lambda: len(station.talk_audio()) == 3)
     assert station.talk_audio() == chunks[:3]
 
+    mark = len(card.messages)
     result = await card.talk(False)
     assert result["result"] == {"talking": False}
-    state = await card.wait_state(talking=False, talk_ready=True)
+    state = await card.wait_state(talking=False, talk_ready=True, since=mark)
     assert station.talk_states() == [1, 0, 1]
     await card.say(chunks[3])  # muted: dropped
     await asyncio.sleep(0.2)
@@ -711,9 +719,10 @@ async def test_two_calls_share_the_view_and_the_last_talker_wins(
 
     await first.talk(True)
     await first.wait_state(talking=True)
+    mark = len(first.messages)
     await second.talk(True)
     await second.wait_state(talking=True)
-    await first.wait_state(talking=False, talk_ready=True)  # taken over
+    await first.wait_state(talking=False, talk_ready=True, since=mark)  # taken over
     assert station.audio_connections == 1
     assert station.talk_states() == [1, 0]  # no toggling between talkers
 
@@ -747,8 +756,9 @@ async def test_a_dropped_talk_channel_turns_talking_off(
     await card.wait_state(state="live")
     await card.talk(True)
     await card.wait_state(talking=True)
+    mark = len(card.messages)  # the call's first states match too
     station.drop_audio_channels()
-    await card.wait_state(talking=False, talk_ready=False)
+    await card.wait_state(talking=False, talk_ready=False, since=mark)
     assert not station.disconnect_times  # the picture goes on
     result = await card.talk(True)  # opens a new one
     assert result["result"] == {"talking": True}
